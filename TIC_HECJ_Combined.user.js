@@ -429,13 +429,20 @@ function isToolInvokedInaccurate(radio) {
   if (name.includes('conv') || id.includes('conv')) return false;
   if (name.includes('context') || id.includes('context')) return false;
   if (name.includes('interaction') || id.includes('interaction')) return false;
+  // Parent walk: only return true when the section is tightly scoped to "tool invoked"
+  // — exclude containers that also mention other field names (response accuracy, helpfulness, etc.)
+  const NEGATIVE_SECTIONS = ['response accuracy', 'response accurate', 'helpfulness', 'bot response', 'answer accuracy', 'quality'];
+  const isSafeParent = (txt) =>
+    txt.includes('tool invoked') &&
+    txt.length < 350 &&
+    !NEGATIVE_SECTIONS.some(neg => txt.includes(neg));
   let parent = radio.parentElement;
   for (let i = 0; i < 15; i++) {
     if (!parent) break;
     const tag = parent.tagName;
     if (tag === 'BODY' || tag === 'HTML') break;
     const fullText = parent.textContent.toLowerCase();
-    if (fullText.includes('tool invoked') && fullText.length < 800) return true;
+    if (isSafeParent(fullText)) return true;
     parent = parent.parentElement;
   }
   if (radio.id) {
@@ -445,7 +452,7 @@ function isToolInvokedInaccurate(radio) {
         let p = lbl.parentElement;
         for (let i = 0; i < 10; i++) {
           if (!p) break;
-          if (p.textContent.toLowerCase().includes('tool invoked') && p.textContent.length < 800) return true;
+          if (isSafeParent(p.textContent.toLowerCase())) return true;
           p = p.parentElement;
         }
       }
