@@ -4,7 +4,7 @@
 // @version      1.3
 // @description  Human Evaluator - Cannot Judge widget + Tool Invoked Clippings in one script
 // @match        https://orbit-gamma.beta.harmony.a2z.com/*
-// @match        https://orbit-beta.beta.harmony.a2z.com/*
+// @match        https://abc-mlops.beta.harmony.a2z.com/reviewer
 // @run-at       document-idle
 // @grant        GM_addStyle
 // ==/UserScript==
