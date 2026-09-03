@@ -120,17 +120,18 @@ function setContextSwitchHE() {
 function openAndSelectHE(trigger) {
   return new Promise((resolve) => {
     trigger.click();
-    // Fast path: React may render the dropdown synchronously
-    const immediate = [...document.querySelectorAll('li, [role="option"], [role="menuitem"]')]
-      .filter(el => el.offsetParent !== null)
+    // Shared finder — catches li, ARIA roles, and any class-based dropdown items
+    const findHE = () => [...document.querySelectorAll(
+      'li, [role="option"], [role="menuitem"], [class*="option"], [class*="item"], [class*="dropdown-item"]'
+    )].filter(el => el.offsetParent !== null)
       .find(el => isHEValue(el.textContent.trim()));
+    // Fast path: React may render the dropdown synchronously
+    const immediate = findHE();
     if (immediate) { immediate.click(); resolve(true); return; }
     // Poll every 30ms (max 300ms) — tight loop, gives up fast if no HE option appears
     let tries = 0;
     const poll = setInterval(() => {
-      const heOption = [...document.querySelectorAll('li, [role="option"], [role="menuitem"]')]
-        .filter(el => el.offsetParent !== null)
-        .find(el => isHEValue(el.textContent.trim()));
+      const heOption = findHE();
       if (heOption) { clearInterval(poll); heOption.click(); resolve(true); return; }
       if (++tries > 10) {
         clearInterval(poll);
@@ -142,12 +143,30 @@ function openAndSelectHE(trigger) {
 }
 
 function getDropdownTriggers() {
-  // Targeted selector avoids scanning every DOM element (was slow on heavy pages)
-  return [...document.querySelectorAll('button, [role="button"], [role="combobox"], [role="listbox"], span, div')].filter(el => {
-    if (!el.offsetParent) return false;
+  // Collect custom dropdown triggers across different placeholder patterns
+  const seen = new Set();
+  const results = [];
+  const candidates = document.querySelectorAll(
+    'button, [role="button"], [role="combobox"], [role="listbox"], [role="option"], span, div'
+  );
+  for (const el of candidates) {
+    if (!el.offsetParent || seen.has(el)) continue;
+    // Skip native selects — handled by setSelectDropdowns()
+    if (el.tagName === 'SELECT') continue;
     const text = el.textContent.trim();
-    return text.length < 60 && /^Select .+\.\.\.$/i.test(text);
-  });
+    if (text.length > 100) continue;
+    const isCombobox = el.getAttribute('role') === 'combobox';
+    const isPlaceholder = /^Select[\s.…]*/i.test(text) ||
+                          /^Choose[\s.…]*/i.test(text) ||
+                          /^-- ?select ?--$/i.test(text) ||
+                          /^none selected$/i.test(text) ||
+                          text === '' && isCombobox;
+    if (isPlaceholder || (isCombobox && !el.getAttribute('aria-expanded'))) {
+      seen.add(el);
+      results.push(el);
+    }
+  }
+  return results;
 }
 
 function setSelectDropdowns() {
@@ -341,7 +360,7 @@ document.body.appendChild(badge);
 const overlay = document.createElement('div');
 overlay.id = 'ti-overlay';
 document.body.appendChild(overlay);
-overlay.addEventListener('click', hidePicker);
+overlay.addEventListener('click', () => { if (Date.now() - lastOpenTime < 600) return; hidePicker(); });
 
 const picker = document.createElement('div');
 picker.id = 'ti-picker';
@@ -349,7 +368,8 @@ document.body.appendChild(picker);
 
 let pickerBusy = false;
 
-function showPicker() { pickerBusy = true; overlay.style.display = 'block'; picker.style.display = 'block'; renderStep1(); }
+let lastOpenTime = 0;
+function showPicker() { pickerBusy = true; lastOpenTime = Date.now(); overlay.style.display = 'block'; picker.style.display = 'block'; renderStep1(); }
 function hidePicker() { overlay.style.display = 'none'; picker.style.display = 'none'; setTimeout(() => { pickerBusy = false; }, 500); }
 
 // ── NEW: Static Response Type = N/A trigger helpers ───────────────────────
