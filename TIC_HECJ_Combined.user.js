@@ -1,15 +1,16 @@
 // ==UserScript==
 // @name         Orbit Tool Invoked clippings & Human evaluator cannot judge
 // @namespace    http://tampermonkey.net/
-// @version      3.4
+// @version      4.0
 // @description  Human Evaluator - Cannot Judge widget + Tool Invoked Clippings in one script
-// @matchhttps://orbit-gamma.beta.harmony.a2z.com/*
-// @match        https://abc-mlops.beta.harmony.a2z.com/reviewer
+// @match        https://orbit-gamma.beta.harmony.a2z.com/*
+// @match        https://orbit-beta.beta.harmony.a2z.com/*
+// @match        https://abc-mlops.beta.harmony.a2z.com/reviewer*
 // @run-at       document-idle
 // @grant        GM_addStyle
 // ==/UserScript==
 
-//==============================
+// ==============================
 // Feature 1: Human Evaluator Widget
 // ==============================
 (function () {
@@ -22,21 +23,13 @@
 
   function createButton() {
     const btn = document.createElement('button');
-    btn.textContent = '🚫Human Evaluator - Cannot Judge';
+    btn.textContent = '🚫 Human Evaluator - Cannot Judge';
     btn.style.cssText = `
-      display: inline-block;
-      margin-left: 10px;
-      vertical-align: middle;
-      background: #1e293b;
-      color: #f8fafc;
-      border: 1.5px solid #475569;
-      border-radius: 6px;
-      padding: 3px 10px;
-      font: 600 11px/1.4 sans-serif;
-      cursor: pointer;
-      box-shadow: 0 1px 4px rgba(0,0,0,0.3);
-      white-space: nowrap;
-      transition: background 0.15s, border-color 0.15s;
+      display: inline-block; margin-left: 10px; vertical-align: middle;
+      background: #1e293b; color: #f8fafc; border: 1.5px solid #475569;
+      border-radius: 6px; padding: 3px 10px; font: 600 11px/1.4 sans-serif;
+      cursor: pointer; box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+      white-space: nowrap; transition: background 0.15s, border-color 0.15s;
     `;
     btn.onmouseenter = () => { btn.style.background = '#0f172a'; btn.style.borderColor = '#94a3b8'; };
     btn.onmouseleave = () => {
@@ -46,14 +39,13 @@
   }
 
   function showFeedback(btn, success) {
-    btn.textContent = success ? '\u2713 Done' : '\u26a0 Check fields';
+    btn.textContent = success ? '✓ Done' : '⚠ Check fields';
     btn.style.background = success ? '#14532d' : '#7f1d1d';
     btn.style.borderColor = success ? '#22c55e' : '#ef4444';
     btn.dataset.active = 'true';
     setTimeout(() => {
       btn.textContent = '🚫 Human Evaluator - Cannot Judge';
-      btn.style.background = '#1e293b';
-      btn.style.borderColor = '#475569';
+      btn.style.background = '#1e293b'; btn.style.borderColor = '#475569';
       delete btn.dataset.active;
     }, 2500);
   }
@@ -74,20 +66,16 @@
   }
 
   function setRadios() {
-    // Group radios by name attribute first; fall back to nearest shared ancestor
-    // so all radio groups — named or unnamed — are covered.
     const byName = {};
     [...document.querySelectorAll('input[type="radio"]')].forEach(radio => {
-      const key = radio.name || radio.getAttribute('data-name') || radio.closest('fieldset')?.id|| (radio.id ? radio.id.replace(/\d+$/, '') : '') || '__unnamed__';
+      const key = radio.name || radio.getAttribute('data-name') || radio.closest('fieldset')?.id
+                  || (radio.id ? radio.id.replace(/\d+$/, '') : '') || '__unnamed__';
       if (!byName[key]) byName[key] = [];
       byName[key].push(radio);
     });
-    // For unnamed group, split by proximity: each radio whose closest block-level
-    // ancestor changes starts a new sub-group.
     const groups = [];
     Object.entries(byName).forEach(([key, radios]) => {
       if (key !== '__unnamed__') { groups.push(radios); return; }
-      // Split unnamed radios by their closest form-section ancestor
       const seen = new Map();
       radios.forEach(r => {
         let anchor = r.closest('fieldset, [role="radiogroup"], section') || r.parentElement;
@@ -117,7 +105,7 @@
       for (let i = 0; i < 12; i++) {
         if (!el) break;
         const txt = el.textContent.toLowerCase();
-        if (txt.includes('context switch') && txt.length< 600) {
+        if (txt.includes('context switch') && txt.length < 600) {
           radio.click();
           radio.dispatchEvent(new Event('change', { bubbles: true }));
           return;
@@ -127,59 +115,158 @@
     }
   }
 
-  // v3.3: before/after snapshot — only click elements that NEWLY APPEARED
-  // after the dropdown opened, so existing page text (radio labels, HE button)
-  // is never accidentally picked. Body mousedown closes dropdown safely.
+  // ── React fiber direct-set (fast-path, fails gracefully) ───────────────────
+
+  function getReactFiber(el) {
+    const key = Object.keys(el).find(k =>
+      k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')
+    );
+    return key ? el[key] : null;
+  }
+
+  function isHEOption(opt) {
+    if (!opt) return false;
+    if (typeof opt === 'string') return isHEValue(opt);
+    if (typeof opt !== 'object') return false;
+    const t = String(
+      opt.label || opt.text || opt.children || opt.name || opt.title ||
+      opt.displayName || opt.displayValue || opt.value || ''
+    ).toLowerCase();
+    return t.includes('human evaluator') || t.includes('cannot judge');
+  }
+
+  function findOptsInChildFibers(fiber, depth) {
+    if (!fiber || depth > 10) return null;
+    const p = fiber.memoizedProps;
+    if (p) {
+      const opts = p.options || p.items || p.data || p.choices || p.menuItems ||
+                   p.selectOptions || p.selectItems || p.listItems || p.dropdownOptions || p.opts;
+      if (Array.isArray(opts) && opts.length > 0) return opts;
+    }
+    return findOptsInChildFibers(fiber.child, depth + 1) ||
+           findOptsInChildFibers(fiber.sibling, depth + 1);
+  }
+
+  function findReactSelectTarget(el) {
+    let domEl = el;
+    for (let d = 0; d < 14 && domEl && domEl !== document.body; d++, domEl = domEl.parentElement) {
+      const fiber = getReactFiber(domEl);
+      if (!fiber) continue;
+      let f = fiber;
+      for (let fd = 0; fd < 30 && f; fd++, f = f.return) {
+        const p = f.memoizedProps;
+        if (!p || typeof p.onChange !== 'function') continue;
+        const directOpts = p.options || p.items || p.data || p.choices || p.menuItems ||
+                           p.selectOptions || p.selectItems || p.listItems || p.dropdownOptions || p.opts;
+        if (Array.isArray(directOpts) && directOpts.length > 0) {
+          const heOpt = directOpts.find(isHEOption);
+          if (heOpt) return { onChange: p.onChange, option: heOpt };
+          for (const grp of directOpts) {
+            const sub = grp && (grp.options || grp.items || grp.children);
+            if (Array.isArray(sub)) {
+              const heOpt2 = sub.find(isHEOption);
+              if (heOpt2) return { onChange: p.onChange, option: heOpt2 };
+            }
+          }
+        }
+        const childOpts = findOptsInChildFibers(f.child, 0);
+        if (childOpts && childOpts.length > 0) {
+          const heOpt = childOpts.find(isHEOption);
+          if (heOpt) return { onChange: p.onChange, option: heOpt };
+          for (const grp of childOpts) {
+            const sub = grp && (grp.options || grp.items || grp.children);
+            if (Array.isArray(sub)) {
+              const heOpt2 = sub.find(isHEOption);
+              if (heOpt2) return { onChange: p.onChange, option: heOpt2 };
+            }
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  function tryDirectReactSelect(trigger) {
+    const target = findReactSelectTarget(trigger);
+    if (!target) return false;
+    try {
+      target.onChange(target.option, { action: 'select-option', option: target.option });
+      return true;
+    } catch (_) {
+      try { target.onChange(target.option); return true; } catch (_2) { return false; }
+    }
+  }
+
+  // ── Visual suppression — hides dropdown overlays while filling ─────────────
+
+  function injectSuppressStyle() {
+    if (document.getElementById('orbit-fill-suppress')) return;
+    const s = document.createElement('style');
+    s.id = 'orbit-fill-suppress';
+    s.textContent = [
+      '[role="listbox"],[role="menu"],[role="option"]',
+      '[class*="dropdown"],[class*="Dropdown"]',
+      '[class*="select__menu"],[class*="SelectMenu"]',
+      '[class*="popover"],[class*="Popover"]',
+      '[data-radix-popper-content-wrapper]',
+    ].join(',') + '{opacity:0!important}';
+    document.head.appendChild(s);
+  }
+
+  function removeSuppressStyle() {
+    const s = document.getElementById('orbit-fill-suppress');
+    if (s) s.remove();
+  }
+
+  // ── MutationObserver UI-click fallback ─────────────────────────────────────
+
+  function fireClicks(el) {
+    ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type =>
+      el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }))
+    );
+  }
+
   function openAndSelectHE(trigger) {
     return new Promise((resolve) => {
       const heBtn = document.getElementById('orbit-he-btn');
 
-      function heSnapshot() {
-        return new Set([...document.querySelectorAll('div,li,span,td,p,a,option')].filter(el => {
-          const r = el.getBoundingClientRect();
-          if (r.width === 0 || r.height === 0) return false;
-          if (heBtn && heBtn.contains(el)) return false;
-          if (el.closest('label')) return false;
-          if (el.querySelector('input[type="radio"]')) return false;
-          const par = el.parentElement;
-          if (par && par.querySelector('input[type="radio"]')) return false;
-          const text = el.textContent.trim();
-          return isHEValue(text) && text.length < 60;
-        }));
-      }
+      const obs = new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+          for (const node of mutation.addedNodes) {
+            if (node.nodeType !== 1) continue;
+            const candidates = node.querySelectorAll
+              ? [node, ...node.querySelectorAll('li,div,span,a,option,p')]
+              : [node];
+            for (const el of candidates) {
+              if (heBtn && heBtn.contains(el)) continue;
+              if (el.closest && el.closest('label')) continue;
+              if (el.querySelector && el.querySelector('input[type="radio"]')) continue;
+              const text = (el.textContent || '').trim();
+              if (!isHEValue(text) || text.length > 60) continue;
+              const r = el.getBoundingClientRect();
+              if (r.width === 0 && r.height === 0) continue;
+              obs.disconnect();
+              clearTimeout(timer);
+              fireClicks(el);
+              // Resolve immediately — no extra wait needed after click.
+              resolve(true);
+              return;
+            }
+          }
+        }
+      });
+      obs.observe(document.body, { childList: true, subtree: true });
 
-      function fireClicks(el) {
-        ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type =>
-          el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }))
-        );
-      }
+      // 60ms timeout: dropdown renders in < 16ms on any modern machine.
+      const timer = setTimeout(() => {
+        obs.disconnect();
+        document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+        resolve(false);
+      }, 60);
 
-      // Snapshot BEFORE opening so we know what was already visible
-      const before = heSnapshot();
-
-      // Open the trigger
       trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
       trigger.click();
       trigger.focus();
-
-      let tries = 0;
-      setTimeout(function poll() {
-        // Only consider elements that newly appeared after the dropdown opened
-        const newOpts = [...heSnapshot()].filter(el => !before.has(el));
-        if (newOpts.length > 0) {
-          const opt = newOpts.find(c => !newOpts.some(o => o !== c && c.contains(o))) || newOpts[0];
-          fireClicks(opt);
-          resolve(true);
-          return;
-        }
-        if (++tries > 10) {
-          // Close any open dropdown by simulating a mousedown outside
-          document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-          resolve(false);
-          return;
-        }
-        setTimeout(poll, 10);
-      }, 8);
     });
   }
 
@@ -205,18 +292,29 @@
   }
 
   async function fillAllWithHE(btn) {
-    btn.textContent = '\u23f3 Filling...';
+    btn.textContent = '⏳ Filling...';
     btn.disabled = true;
-    // Native selects are independent — fill first.
+
     setSelectDropdowns();
-    // Dropdowns next; radios fill LAST so any re-render caused by a dropdown
-    // selection does not reset radio values that were set earlier.
-    const triggers = getDropdownTriggers();
-    for (const trigger of triggers) {
-      await openAndSelectHE(trigger);
-    }
     setRadios();
     setContextSwitchHE();
+
+    const triggers = getDropdownTriggers();
+    const uiFallbacks = [];
+    for (const trigger of triggers) {
+      if (!tryDirectReactSelect(trigger)) uiFallbacks.push(trigger);
+    }
+
+    if (uiFallbacks.length > 0) injectSuppressStyle();
+    for (const trigger of uiFallbacks) {
+      await openAndSelectHE(trigger);
+    }
+    removeSuppressStyle();
+
+    // Second pass: some frameworks re-render radios after dropdown closes.
+    setRadios();
+    setContextSwitchHE();
+
     btn.disabled = false;
     showFeedback(btn, true);
   }
@@ -232,6 +330,10 @@
     const btn = createButton();
     btn.id = 'orbit-he-btn';
     btn.addEventListener('click', (e) => { e.preventDefault(); fillAllWithHE(btn); });
+    // Place button inline beside the heading text, not below it.
+    labelEl.style.display = 'inline-flex';
+    labelEl.style.alignItems = 'center';
+    labelEl.style.flexWrap = 'nowrap';
     labelEl.appendChild(btn);
   }
 
@@ -250,15 +352,16 @@
     'use strict';
 
     const TOOL_MAP = {
-        'Your Orders':['get_orders_information','get_orders'],
-        'Approvals':                ['diagnose_approval_execution','get_approval_delegations','get_approval_notifications'],
+        'Your Orders':                ['get_orders_information','get_orders'],
+        'Approvals':                  ['diagnose_approval_execution','get_approval_delegations','get_approval_notifications'],
         'Tax Exemption (ATEP)':       ['diagnose_tax_exemption_issue','get_atep_checkout_configuration','get_enrollment_status','get_exemption_assignment_snapshot','list_exemptions'],
         'Guided Buying':              ['GBQuery_POC','GBGetPolicies','GBListApplicablePolicies','GBListAvailableTemplates'],
         'Savings Agent':              ['get_savings_recommendation'],
         'Spend Anomaly Monitoring':   ['get_spend_anomaly_reviews','get_spend_anomaly_recommendations'],
         'Business Order Information': ['diagnose_custom_order_fields'],
         'Pay By Invoice / BCA':       ['get_pay_by_invoice_account_summary','get_pay_by_invoice_transactions'],
-        'KB / Feature Queries':       ['search_amazon_business_knowledge_base'],};
+        'KB / Feature Queries':       ['search_amazon_business_knowledge_base'],
+    };
 
     const ALL_TOOLS = [
         'diagnose_approval_execution','diagnose_custom_order_fields','diagnose_tax_exemption_issue',
@@ -273,10 +376,10 @@
     ];
 
     const TOOL_DESCRIPTIONS = {
-        'diagnose_approval_execution':'Diagnoses approval execution for an order - status, applied policy, approver, buyer, delegator, checkout group and timeline',
-        'diagnose_custom_order_fields':'Diagnoses Custom Order Fields (COF) / Business Order Information (BOI) - checkout group config, PO number, cost center, GL code, project code',
+        'diagnose_approval_execution':           'Diagnoses approval execution for an order - status, applied policy, approver, buyer, delegator, checkout group and timeline',
+        'diagnose_custom_order_fields':          'Diagnoses Custom Order Fields (COF) / Business Order Information (BOI) - checkout group config, PO number, cost center, GL code, project code',
         'diagnose_tax_exemption_issue':          'Diagnoses why a tax exemption is not applying at checkout - root_cause, severity, explanation, resolution steps, action_url',
-        'GBGetPolicies':'Retrieves specific Guided Buying policies by resource policy ID - title, intent, description, group, criteria, and view link',
+        'GBGetPolicies':                         'Retrieves specific Guided Buying policies by resource policy ID - title, intent, description, group, criteria, and view link',
         'GBListApplicablePolicies':              'Lists and searches Guided Buying policies that apply to a business group - title, resource policy ID, intent, audit metadata, enriched criteria',
         'GBListAvailableTemplates':              'Lists Guided Buying policy types available for a business group - what policy types can be created based on BP tier and marketplace',
         'GBQuery_POC':                           'Read-only Guided Buying query - policy lookup, matching rules, conflict resolution, customer-specific policy analysis',
@@ -299,7 +402,7 @@
 
     const HVA_KEYWORD_MAP = [
         { keywords: ['your order','order information'], category: 'Your Orders' },
-        { keywords: ['approval'],category: 'Approvals' },
+        { keywords: ['approval'],                       category: 'Approvals' },
         { keywords: ['atep','tax exemption','tax'],     category: 'Tax Exemption (ATEP)' },
         { keywords: ['guided buying'],                  category: 'Guided Buying' },
         { keywords: ['savings agent','savings'],        category: 'Savings Agent' },
@@ -356,7 +459,8 @@
         .ti-toast { position:fixed;bottom:100px;right:15px;background:#0a2540;color:#66aaff;padding:10px 20px;border-radius:8px;font-size:13px;z-index:100002;box-shadow:0 4px 14px rgba(0,0,0,0.35);font-family:Arial,sans-serif;border:1px solid #66aaff;font-weight:bold; }
         #ti-picker .ti-opt-dpq { border-left-color:#e65c00;background:#fff3e0;color:#131921; }
         #ti-picker .ti-opt-dpq:hover { background:#e65c00;color:#ffffff;border-color:#e65c00;border-left-color:#e65c00; }
-        .ti-hide { display:none !important; }`);
+        .ti-hide { display:none !important; }
+    `);
 
     const badge = document.createElement('div');
     badge.id = 'ti-badge';
@@ -386,7 +490,7 @@
         const val = (radio.value || '').trim().toLowerCase();
         if (val !== 'inaccurate') return false;
         const name = (radio.name || '').toLowerCase();
-        const id= (radio.id   || '').toLowerCase();
+        const id   = (radio.id   || '').toLowerCase();
 
         if (name === 'tool-accurate' || name === 'tool_accurate' || name === 'toolaccurate') return true;
         if (name.includes('tool') && (name.includes('accur') || name.includes('invok'))) return true;
@@ -398,13 +502,10 @@
         if (name.includes('context') || id.includes('context')) return false;
         if (name.includes('interaction') || id.includes('interaction')) return false;
 
-        // FIX: reduced threshold800->350 and added NEGATIVE_SECTIONS so a shared
-        // parent containing both "Tool Invoked Accurate" and other sections doesn't
-        // cause a false positive for the wrong radio.
         const NEGATIVE_SECTIONS = ['response accuracy', 'response accurate', 'response content', 'helpfulness', 'bot response'];
         const isSafeSection = (txt) =>
             txt.includes('tool invoked') &&
-            txt.length< 350 &&
+            txt.length < 350 &&
             !NEGATIVE_SECTIONS.some(n => txt.includes(n));
 
         let parent = radio.parentElement;
@@ -440,12 +541,11 @@
                     const t = sib.textContent.toLowerCase().trim();
                     if (t.length > 200) continue;
                     if (t.includes('tool invoked')) return true;
-                    // FIX: original check'response accurate' doesn't match "Response Content Accurate"
-                    // (has "content" between "response" and "accurate"). Broadened to catch all variants.
                     if ((t.includes('response') && t.includes('accur')) || t.includes('response accuracy') || t.includes('response accurate')) return false;
                     if (t.includes('context switch') || t.includes('conversation context')) return false;
                     if (t.includes('interaction type') || t.includes('interaction accuracy')) return false;
-                }el = el.parentElement;
+                }
+                el = el.parentElement;
             }
         } catch(e) {}
 
@@ -475,7 +575,6 @@
     }
 
     function getDetectedHVA() {
-        //1. Native<select> with hva/category in name or id
         const selects = document.querySelectorAll('select');
         for (const sel of selects) {
             const nameOrId = (sel.name || sel.id || '').toLowerCase();
@@ -486,8 +585,6 @@
                 if (entry.keywords.some(kw => val.includes(kw))) return entry.category;
             }
         }
-        // 2. Custom dropdown: find a label/heading containing "hva" or "category",
-        //    then check its nearby trigger element for a non-placeholder selected value.
         const labelEls = [...document.querySelectorAll('label,span,p,div,h3,h4,h5,legend,th,td')];
         for (const lbl of labelEls) {
             const lt = lbl.textContent.trim().toLowerCase();
@@ -519,14 +616,16 @@
             '[id="expected_tool_invocation"]','[id="expected-tool-invocation"]','[id="expectedToolInvocation"]',
             '[id="expected_tool"]','[id="expected-tool"]','[id="tool_invocation"]','[id="tool-invocation"]',
             '[name*="expected_tool" i]','[name*="expected-tool" i]','[id*="expected_tool" i]','[id*="expected-tool" i]',
-            '[name*="tool_invoc" i]','[id*="tool_invoc" i]',];
+            '[name*="tool_invoc" i]','[id*="tool_invoc" i]',
+        ];
         for (const sel of attrSelectors) {
             try { const el = document.querySelector(sel); if (el && el.offsetParent !== null) { console.log('[TI Filler] Found via:', sel); return el; } } catch(e) {}
         }
         const placeholderSelectors = [
             'textarea[placeholder*="expected tool" i]','input[placeholder*="expected tool" i]',
             'textarea[placeholder*="tool invoc" i]','input[placeholder*="tool invoc" i]',
-            'textarea[placeholder*="tool should" i]','input[placeholder*="tool should" i]',];
+            'textarea[placeholder*="tool should" i]','input[placeholder*="tool should" i]',
+        ];
         for (const sel of placeholderSelectors) {
             const el = document.querySelector(sel);
             if (el && el.offsetParent !== null) { console.log('[TI Filler] Found via placeholder:', sel); return el; }
@@ -569,7 +668,8 @@
             : '';
         picker.innerHTML =
             '<div class="ti-header"><h3>Tool Invoked - Inaccurate</h3><div class="ti-step-label">Step 1 - What happened?</div></div>' +
-            '<div class="ti-body">' + hvaNote +'<div class="ti-opt-row"><button class="ti-opt ti-opt-dpq" id="ti-dpq-btn">Direct product query<br/><small style="font-weight:normal;color:inherit;opacity:0.8;">Fills Expected Tool Invocation: No</small></button></div>' +
+            '<div class="ti-body">' + hvaNote +
+            '<div class="ti-opt-row"><button class="ti-opt ti-opt-dpq" id="ti-dpq-btn">Direct product query<br/><small style="font-weight:normal;color:inherit;opacity:0.8;">Fills Expected Tool Invocation: No</small></button></div>' +
             '<div class="ti-opt-row"><button class="ti-opt" id="ti-wrong-tool-btn">Expected tool was not invoked<br/><small style="font-weight:normal;color:inherit;opacity:0.8;">Fills: [expected tool name]</small></button></div>' +
             '<div class="ti-opt-row"><button class="ti-opt ti-opt-kb" id="ti-kb-tool-btn">No tool - KB query (bot gave KB info)<br/><small style="font-weight:normal;color:inherit;opacity:0.8;">Fills: search_amazon_business_knowledge_base</small></button></div>' +
             '<div class="ti-section-label">Troubleshoot</div>' +
@@ -634,7 +734,7 @@
         });
         const savedCustomTools = getCustomTools();
         html += '<div class="ti-section-label">Custom Tool</div>' +
-            '<div style="padding:00 6px;"><input type="text" id="ti-custom-tool-input" class="ti-search" placeholder="Type any tool name..." style="margin-bottom:6px;" />' +
+            '<div style="padding:0 0 6px;"><input type="text" id="ti-custom-tool-input" class="ti-search" placeholder="Type any tool name..." style="margin-bottom:6px;" />' +
             '<div style="display:flex;gap:8px;">' +
             '<button id="ti-custom-fill-btn" style="flex:1;padding:9px 14px;background:#FF9900;color:#131921;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">Fill Now</button>' +
             '<button id="ti-custom-save-btn" style="flex:1;padding:9px 14px;background:#131921;color:#FF9900;border:1.5px solid #FF9900;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">Save &amp; Fill</button>' +
@@ -744,11 +844,9 @@
     }
 
     document.addEventListener('keydown', (e) => {
-        // Ctrl+Shift+T to open picker. Escape is intentionally NOT handled here —
-        // programmatic Escape dispatched by dropdowns (e.g. on this page) must not
-        // close the picker. Use the Cancel button inside the picker to close it.
-        if (e.ctrlKey && e.shiftKey && e.key === 'T') { e.preventDefault(); showPicker(); }});
+        if (e.ctrlKey && e.shiftKey && e.key === 'T') { e.preventDefault(); showPicker(); }
+    });
 
-    console.log('[Tool Invoked Clippings v3.4.0] Loaded');
+    console.log('[Tool Invoked Clippings v4.0.0] Loaded');
 
 })();
