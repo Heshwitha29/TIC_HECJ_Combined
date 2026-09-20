@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Orbit Tool Invoked clippings & Human evaluator cannot judge
 // @namespace    http://tampermonkey.net/
-// @version      4.0
-// @description  Human Evaluator - Cannot Judge widget + Tool Invoked Clippings in one script
+// @version      4.2.6
+// @description  HE Cannot Judge widget + TI Clippings. Done shown immediately; __orbitHEFilling guard prevents TI picker opening during HE fill
 // @match        https://orbit-gamma.beta.harmony.a2z.com/*
 // @match        https://orbit-beta.beta.harmony.a2z.com/*
 // @match        https://abc-mlops.beta.harmony.a2z.com/reviewer*
@@ -23,7 +23,7 @@
 
   function createButton() {
     const btn = document.createElement('button');
-    btn.textContent = '🚫 Human Evaluator - Cannot Judge';
+    btn.textContent = '\u{1F6AB} Human Evaluator - Cannot Judge';
     btn.style.cssText = `
       display: inline-block; margin-left: 10px; vertical-align: middle;
       background: #1e293b; color: #f8fafc; border: 1.5px solid #475569;
@@ -39,12 +39,12 @@
   }
 
   function showFeedback(btn, success) {
-    btn.textContent = success ? '✓ Done' : '⚠ Check fields';
+    btn.textContent = success ? '\u2713 Done' : '\u26a0 Check fields';
     btn.style.background = success ? '#14532d' : '#7f1d1d';
     btn.style.borderColor = success ? '#22c55e' : '#ef4444';
     btn.dataset.active = 'true';
     setTimeout(() => {
-      btn.textContent = '🚫 Human Evaluator - Cannot Judge';
+      btn.textContent = '\u{1F6AB} Human Evaluator - Cannot Judge';
       btn.style.background = '#1e293b'; btn.style.borderColor = '#475569';
       delete btn.dataset.active;
     }, 2500);
@@ -64,8 +64,8 @@
     if (radio.nextElementSibling) return radio.nextElementSibling.textContent.trim();
     return radio.value || '';
   }
-
   function setRadios() {
+    // -- Native <input type="radio"> --
     const byName = {};
     [...document.querySelectorAll('input[type="radio"]')].forEach(radio => {
       const key = radio.name || radio.getAttribute('data-name') || radio.closest('fieldset')?.id
@@ -94,16 +94,39 @@
         }
       }
     });
+    // -- AWSUI/CloudScape [role="radio"] elements --
+    const awsuiGroups = new Map();
+    document.querySelectorAll('[role="radio"]').forEach(el => {
+      if (!el.offsetParent) return;
+      const container = el.closest('[role="radiogroup"]') || el.parentElement;
+      if (!awsuiGroups.has(container)) awsuiGroups.set(container, []);
+      awsuiGroups.get(container).push(el);
+    });
+    awsuiGroups.forEach(radios => {
+      for (const radio of radios) {
+        const label = radio.getAttribute('aria-label') || radio.textContent || '';
+        if (isHEValue(label)) {
+          radio.click();
+          radio.dispatchEvent(new Event('change', { bubbles: true }));
+          break;
+        }
+      }
+    });
   }
 
+  // v1.3-style setContextSwitchHE: iterate all HE-labeled radios, walk UP the DOM
+  // to confirm the radio lives inside a "Context Switch" field container, then click.
+  // Called with a 400ms delay (see fillAllWithHE) so it runs AFTER the Auto Context
+  // Switch v6.2 script fires -- ensuring our HE selection is the final state.
   function setContextSwitchHE() {
+    // Native radios
     const allRadios = [...document.querySelectorAll('input[type="radio"]')];
     for (const radio of allRadios) {
       const label = getRadioLabel(radio);
       if (!isHEValue(label) && !isHEValue(radio.value)) continue;
       let el = radio.parentElement;
       for (let i = 0; i < 12; i++) {
-        if (!el) break;
+        if (!el || el === document.body) break;
         const txt = el.textContent.toLowerCase();
         if (txt.includes('context switch') && txt.length < 600) {
           radio.click();
@@ -113,10 +136,23 @@
         el = el.parentElement;
       }
     }
+    // AWSUI [role="radio"] fallback
+    document.querySelectorAll('[role="radio"]').forEach(r => {
+      if (!r.offsetParent) return;
+      const l = r.getAttribute('aria-label') || r.textContent.trim();
+      if (!isHEValue(l) || l.length > 80) return;
+      let el = r.parentElement;
+      for (let i = 0; i < 12; i++) {
+        if (!el || el === document.body) break;
+        const txt = el.textContent.toLowerCase();
+        if (txt.includes('context switch') && txt.length < 600) {
+          r.click(); r.dispatchEvent(new Event('change', { bubbles: true })); return;
+        }
+        el = el.parentElement;
+      }
+    });
   }
-
-  // ── React fiber direct-set (fast-path, fails gracefully) ───────────────────
-
+  // -- React fiber direct-set (fast-path, fails gracefully) --
   function getReactFiber(el) {
     const key = Object.keys(el).find(k =>
       k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')
@@ -147,6 +183,9 @@
            findOptsInChildFibers(fiber.sibling, depth + 1);
   }
 
+  // Returns {onChange, option} when HE found via React fiber,
+  // {noHE:true} when options array exists but contains no HE (skip UI fallback),
+  // or null when fiber is inaccessible.
   function findReactSelectTarget(el) {
     let domEl = el;
     for (let d = 0; d < 14 && domEl && domEl !== document.body; d++, domEl = domEl.parentElement) {
@@ -168,6 +207,7 @@
               if (heOpt2) return { onChange: p.onChange, option: heOpt2 };
             }
           }
+          return { noHE: true }; // Options found, but no HE — skip UI fallback
         }
         const childOpts = findOptsInChildFibers(f.child, 0);
         if (childOpts && childOpts.length > 0) {
@@ -180,15 +220,18 @@
               if (heOpt2) return { onChange: p.onChange, option: heOpt2 };
             }
           }
+          return { noHE: true }; // Options found, but no HE — skip UI fallback
         }
       }
     }
     return null;
   }
-
+  // Returns true (HE selected), 'no-he' (options found, no HE — skip UI fallback),
+  // or false (fiber inaccessible — try UI fallback).
   function tryDirectReactSelect(trigger) {
     const target = findReactSelectTarget(trigger);
     if (!target) return false;
+    if (target.noHE) return 'no-he';
     try {
       target.onChange(target.option, { action: 'select-option', option: target.option });
       return true;
@@ -197,8 +240,7 @@
     }
   }
 
-  // ── Visual suppression — hides dropdown overlays while filling ─────────────
-
+  // -- Visual suppression during fill --
   function injectSuppressStyle() {
     if (document.getElementById('orbit-fill-suppress')) return;
     const s = document.createElement('style');
@@ -209,6 +251,8 @@
       '[class*="select__menu"],[class*="SelectMenu"]',
       '[class*="popover"],[class*="Popover"]',
       '[data-radix-popper-content-wrapper]',
+      '[class*="awsui"][class*="dropdown"]',
+      '[class*="awsui"][class*="options"]',
     ].join(',') + '{opacity:0!important}';
     document.head.appendChild(s);
   }
@@ -218,24 +262,22 @@
     if (s) s.remove();
   }
 
-  // ── MutationObserver UI-click fallback ─────────────────────────────────────
-
   function fireClicks(el) {
     ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type =>
       el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }))
     );
   }
 
-  function openAndSelectHE(trigger) {
+  function openAndSelectHE(trigger, btn) {
     return new Promise((resolve) => {
       const heBtn = document.getElementById('orbit-he-btn');
-
       const obs = new MutationObserver((mutations) => {
+        if (btn && !btn.isConnected) { obs.disconnect(); clearTimeout(timer); resolve(false); return; }
         for (const mutation of mutations) {
           for (const node of mutation.addedNodes) {
             if (node.nodeType !== 1) continue;
             const candidates = node.querySelectorAll
-              ? [node, ...node.querySelectorAll('li,div,span,a,option,p')]
+              ? [node, ...node.querySelectorAll('[role="option"],[data-value],li,div,span,a,option,p')]
               : [node];
             for (const el of candidates) {
               if (heBtn && heBtn.contains(el)) continue;
@@ -243,40 +285,43 @@
               if (el.querySelector && el.querySelector('input[type="radio"]')) continue;
               const text = (el.textContent || '').trim();
               if (!isHEValue(text) || text.length > 60) continue;
-              const r = el.getBoundingClientRect();
-              if (r.width === 0 && r.height === 0) continue;
-              obs.disconnect();
-              clearTimeout(timer);
-              fireClicks(el);
-              // Resolve immediately — no extra wait needed after click.
-              resolve(true);
-              return;
+              const isRoleOption = el.getAttribute && el.getAttribute('role') === 'option';
+              if (!isRoleOption) {
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 && r.height === 0) continue;
+              }
+              obs.disconnect(); clearTimeout(timer); fireClicks(el); resolve(true); return;
             }
           }
         }
       });
       obs.observe(document.body, { childList: true, subtree: true });
-
-      // 60ms timeout: dropdown renders in < 16ms on any modern machine.
       const timer = setTimeout(() => {
         obs.disconnect();
         document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
         resolve(false);
-      }, 60);
-
+      }, 50);
       trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-      trigger.click();
-      trigger.focus();
+      trigger.click(); trigger.focus();
     });
   }
 
   function getDropdownTriggers() {
-    return [...document.querySelectorAll('div,button,span,input,select')].filter(el => {
-      if (!el.offsetParent) return false;
-      const text = el.textContent.trim();
-      if (text.length > 80) return false;
-      return /^Select(?:\.\.\.| .+\.\.\.?)$/i.test(text);
+    const seen = new WeakSet(); const results = [];
+    document.querySelectorAll(
+      'button[aria-haspopup="listbox"], button[aria-haspopup="true"], [role="combobox"][aria-haspopup], [aria-haspopup="listbox"]'
+    ).forEach(el => {
+      if (!el.offsetParent || seen.has(el)) return;
+      if (isHEValue(el.textContent)) return;
+      seen.add(el); results.push(el);
     });
+    [...document.querySelectorAll('div,button,span,input,select')].forEach(el => {
+      if (!el.offsetParent || seen.has(el)) return;
+      const text = el.textContent.trim();
+      if (text.length > 80 || isHEValue(text)) return;
+      if (/^Select(?:\.\.\.| .+\.\.\.?)$/i.test(text)) { seen.add(el); results.push(el); }
+    });
+    return results;
   }
 
   function setSelectDropdowns() {
@@ -292,53 +337,67 @@
   }
 
   async function fillAllWithHE(btn) {
-    btn.textContent = '⏳ Filling...';
-    btn.disabled = true;
-
-    setSelectDropdowns();
-    setRadios();
-    setContextSwitchHE();
-
-    const triggers = getDropdownTriggers();
-    const uiFallbacks = [];
+    window.__orbitHEFilling = true;
+    btn.textContent = '⏳ Filling...'; btn.disabled = true;
+    setSelectDropdowns(); setRadios();
+    // Handle dropdowns: React fiber first, UI fallback for the rest
+    const triggers = getDropdownTriggers(); const uiFallbacks = [];
     for (const trigger of triggers) {
-      if (!tryDirectReactSelect(trigger)) uiFallbacks.push(trigger);
+      const r = tryDirectReactSelect(trigger);
+      if (r === false) uiFallbacks.push(trigger);
     }
-
     if (uiFallbacks.length > 0) injectSuppressStyle();
     for (const trigger of uiFallbacks) {
-      await openAndSelectHE(trigger);
+      if (!btn.isConnected) { removeSuppressStyle(); return; }
+      await openAndSelectHE(trigger, btn);
     }
     removeSuppressStyle();
-
-    // Second pass: some frameworks re-render radios after dropdown closes.
+    if (!btn.isConnected) return;
+    // Second radio pass: only wait if UI-fallback dropdowns needed opening;
+    // if everything resolved via React fiber (or no dropdowns at all) skip the delay.
+    if (uiFallbacks.length > 0) await new Promise(r => setTimeout(r, 100));
     setRadios();
-    setContextSwitchHE();
-
-    btn.disabled = false;
-    showFeedback(btn, true);
+    // Show Done immediately -- all visible fields are filled.
+    // Then after 400ms, silently override Context Switch so we win against
+    // Auto Context Switch v6.2 (which fires asynchronously after our fill).
+    btn.disabled = false; showFeedback(btn, true);
+    setTimeout(() => { window.__orbitHEFilling = false; if (btn.isConnected) setContextSwitchHE(); }, 450);
   }
 
   function injectButton() {
     if (document.getElementById('orbit-he-btn')) return;
     const allEls = [...document.querySelectorAll('label, legend, p, span, b, strong, div, h1,h2,h3,h4,h5')];
-    const labelEl = allEls.find(el => {
-      const own = [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-      return own.includes('Turn Type Classification');
-    });
+    const PATTERNS = ['Turn Type Classification','Turn Classification','Evaluator Classification','Annotation Type'];
+    let labelEl = null;
+    for (const p of PATTERNS) {
+      labelEl = allEls.find(el => [...el.childNodes].filter(n => n.nodeType===3).map(n=>n.textContent.trim()).join('').includes(p));
+      if (labelEl) break;
+    }
+    if (!labelEl) {
+      // Native radio fallback
+      const firstRadio = document.querySelector('input[type="radio"]');
+      if (firstRadio) {
+        labelEl = firstRadio.closest('fieldset')?.querySelector('legend') || firstRadio.parentElement;
+      } else {
+        // AWSUI [role="radio"] fallback (abc-mlops/harmony uses no native radios)
+        const firstAwsui = document.querySelector('[role="radio"]');
+        if (firstAwsui) {
+          labelEl = firstAwsui.closest('[role="radiogroup"]')?.previousElementSibling
+                    || firstAwsui.closest('[role="radiogroup"]')?.parentElement?.querySelector('label,legend,span,p,b,strong')
+                    || firstAwsui.parentElement;
+        }
+      }
+    }
     if (!labelEl) return;
-    const btn = createButton();
-    btn.id = 'orbit-he-btn';
+    const btn = createButton(); btn.id = 'orbit-he-btn';
     btn.addEventListener('click', (e) => { e.preventDefault(); fillAllWithHE(btn); });
-    // Place button inline beside the heading text, not below it.
-    labelEl.style.display = 'inline-flex';
-    labelEl.style.alignItems = 'center';
-    labelEl.style.flexWrap = 'nowrap';
+    labelEl.style.display = 'inline-flex'; labelEl.style.alignItems = 'center'; labelEl.style.flexWrap = 'nowrap';
     labelEl.appendChild(btn);
   }
 
   const observer = new MutationObserver(() => {
-    if (document.querySelector('input[type="radio"]')) injectButton();
+    // Trigger on either native radios (orbit-gamma/beta) or AWSUI [role="radio"] (abc-mlops/harmony)
+    if (document.querySelector('input[type="radio"], [role="radio"]')) injectButton();
   });
   observer.observe(document.body, { childList: true, subtree: true });
   injectButton();
@@ -360,7 +419,9 @@
         'Spend Anomaly Monitoring':   ['get_spend_anomaly_reviews','get_spend_anomaly_recommendations'],
         'Business Order Information': ['diagnose_custom_order_fields'],
         'Pay By Invoice / BCA':       ['get_pay_by_invoice_account_summary','get_pay_by_invoice_transactions'],
-        'KB / Feature Queries':       ['search_amazon_business_knowledge_base'],
+        'KB / Feature Queries':       ['search_amazon_business_knowledge_base','search_ab_documentation','read_ab_documentation'],
+        'AB Payments':                    ['get_available_payment_methods','get_amazon_card_benefits'],
+        'Pay By Invoice / BCA (Payments)':['get_pay_by_invoice_payment_allocation'],
     };
 
     const ALL_TOOLS = [
@@ -371,8 +432,10 @@
         'get_orders','get_orders_information',
         'get_pay_by_invoice_account_summary','get_pay_by_invoice_transactions',
         'get_savings_recommendation','get_spend_anomaly_recommendations','get_spend_anomaly_reviews',
-        'list_exemptions',
-        'search_amazon_business_knowledge_base',
+        'get_amazon_card_benefits','get_available_payment_methods',
+        'get_pay_by_invoice_payment_allocation',
+        'list_exemptions','read_ab_documentation',
+        'search_ab_documentation','search_amazon_business_knowledge_base',
     ];
 
     const TOOL_DESCRIPTIONS = {
@@ -397,6 +460,11 @@
         'get_spend_anomaly_recommendations':     'Policy recommendations to prevent future spend anomalies - category/item restrictions based on flagged purchases',
         'get_spend_anomaly_reviews':             'Lists spend anomalies / unusual orders - defaults last 30 days, up to 90 days. Returns anomaly details, order ID, buyer info, type',
         'list_exemptions':                       'Lists tax exemptions - filter by status, jurisdiction, expiring_within_days. Returns id, name, status, expiration, type',
+        'get_amazon_card_benefits':              'Retrieves personalised Amazon card benefit and eligibility details — cashback rates, benefit tiers. Call get_available_payment_methods first to obtain payment method ID',
+        'get_available_payment_methods':         'Retrieves the customer\'s available payment methods from wallet — card details, brand, last digits, product name. Call first for any personalised card query',
+        'get_pay_by_invoice_payment_allocation': 'Get payment allocation details showing which invoices and credit memos were applied to a specific payment — transaction IDs, amounts, statuses',
+        'read_ab_documentation':                 'Retrieve full content of a specific AB integration document (Punchout / MLE guide) using the document reference returned by search_ab_documentation',
+        'search_ab_documentation':               'Search AB customer-facing integration documentation — Punchout guides for 30+ procurement platforms and MLE self-serve configuration guides',
         'search_amazon_business_knowledge_base': 'Fallback KB tool - searches AB knowledge base for HVA feature and informational queries across all AB categories and features',
     };
 
@@ -409,6 +477,8 @@
         { keywords: ['spend anomaly','anomaly'],        category: 'Spend Anomaly Monitoring' },
         { keywords: ['business order info','boi','cof'],category: 'Business Order Information' },
         { keywords: ['pay by invoice','pbi','bca','invoice'], category: 'Pay By Invoice / BCA' },
+        { keywords: ['payment method','card','cashback','amazon card','card benefits'], category: 'AB Payments' },
+        { keywords: ['punchout','mle','multi-legal entity','procurement','ariba','coupa','integration doc'], category: 'KB / Feature Queries' },
     ];
 
     function getCustomTools() {
@@ -438,8 +508,6 @@
         #ti-picker .ti-opt-row { display:flex;align-items:flex-start;gap:6px;margin-bottom:7px; }
         #ti-picker .ti-opt { flex:1;padding:10px 14px 10px 16px;background:#f8f8f8;border:1px solid #e0e0e0;border-left:5px solid #FF9900;border-radius:6px;cursor:pointer;text-align:left;font-size:13px;color:#131921;line-height:1.5;box-sizing:border-box;white-space:normal;transition:background 0.15s,color 0.15s; }
         #ti-picker .ti-opt:hover { background:#131921;color:#FF9900;border-left-color:#FF9900;border-color:#131921; }
-        #ti-picker .ti-opt-no { border-left-color:#cc0000;background:#fff5f5; }
-        #ti-picker .ti-opt-no:hover { background:#cc0000;color:#ffffff;border-color:#cc0000;border-left-color:#cc0000; }
         #ti-picker .ti-opt-kb { border-left-color:#0066cc;background:#e8f4fd;color:#131921; }
         #ti-picker .ti-opt-kb:hover { background:#0066cc;color:#ffffff;border-color:#0066cc;border-left-color:#0066cc; }
         #ti-picker .ti-opt-tool { background:#f0f8ff;border-left-color:#0066cc;border-color:#cce0ff;color:#131921;font-family:monospace;font-size:12px; }
@@ -463,25 +531,17 @@
     `);
 
     const badge = document.createElement('div');
-    badge.id = 'ti-badge';
-    badge.textContent = '\u{1F535} TI Filler Active';
+    badge.id = 'ti-badge'; badge.textContent = '\u{1F535} TI Filler Active';
     badge.title = 'Click to open Tool Invoked picker (or Ctrl+Shift+T)';
     badge.addEventListener('click', () => showPicker());
     document.body.appendChild(badge);
-
     const overlay = document.createElement('div');
-    overlay.id = 'ti-overlay';
-    overlay.addEventListener('click', () => hidePicker());
+    overlay.id = 'ti-overlay'; overlay.addEventListener('click', () => hidePicker());
     document.body.appendChild(overlay);
-
     let lastOpenTime = 0;
-
-    const picker = document.createElement('div');
-    picker.id = 'ti-picker';
+    const picker = document.createElement('div'); picker.id = 'ti-picker';
     document.body.appendChild(picker);
-
     let pickerBusy = false;
-
     function showPicker() { pickerBusy = true; lastOpenTime = Date.now(); overlay.style.display = 'block'; picker.style.display = 'block'; renderStep1(); }
     function hidePicker() { overlay.style.display = 'none'; picker.style.display = 'none'; setTimeout(() => { pickerBusy = false; }, 500); }
 
@@ -491,53 +551,34 @@
         if (val !== 'inaccurate') return false;
         const name = (radio.name || '').toLowerCase();
         const id   = (radio.id   || '').toLowerCase();
-
         if (name === 'tool-accurate' || name === 'tool_accurate' || name === 'toolaccurate') return true;
         if (name.includes('tool') && (name.includes('accur') || name.includes('invok'))) return true;
         if (id.startsWith('ta-')) return true;
         if (id.includes('tool') && (id.includes('accur') || id.includes('invok'))) return true;
-
         if (name.includes('response') || id.includes('response')) return false;
         if (name.includes('conv') || id.includes('conv')) return false;
         if (name.includes('context') || id.includes('context')) return false;
         if (name.includes('interaction') || id.includes('interaction')) return false;
-
-        const NEGATIVE_SECTIONS = ['response accuracy', 'response accurate', 'response content', 'helpfulness', 'bot response'];
-        const isSafeSection = (txt) =>
-            txt.includes('tool invoked') &&
-            txt.length < 350 &&
-            !NEGATIVE_SECTIONS.some(n => txt.includes(n));
-
+        const NEG = ['response accuracy','response accurate','response content','helpfulness','bot response'];
+        const safe = (txt) => txt.includes('tool invoked') && txt.length < 350 && !NEG.some(n => txt.includes(n));
         let parent = radio.parentElement;
         for (let i = 0; i < 15; i++) {
-            if (!parent) break;
-            const tag = parent.tagName;
+            if (!parent) break; const tag = parent.tagName;
             if (tag === 'BODY' || tag === 'HTML') break;
-            const fullText = parent.textContent.toLowerCase();
-            if (isSafeSection(fullText)) return true;
+            if (safe(parent.textContent.toLowerCase())) return true;
             parent = parent.parentElement;
         }
-
         if (radio.id) {
             try {
                 const lbl = document.querySelector('label[for="' + CSS.escape(radio.id) + '"]');
-                if (lbl) {
-                    let p = lbl.parentElement;
-                    for (let i = 0; i < 10; i++) {
-                        if (!p) break;
-                        if (isSafeSection(p.textContent.toLowerCase())) return true;
-                        p = p.parentElement;
-                    }
-                }
+                if (lbl) { let p = lbl.parentElement; for (let i = 0; i < 10; i++) { if (!p) break; if (safe(p.textContent.toLowerCase())) return true; p = p.parentElement; } }
             } catch(e) {}
         }
-
         try {
             let el = radio;
             for (let i = 0; i < 8; i++) {
                 if (!el || !el.parentElement) break;
-                const siblings = Array.from(el.parentElement.children);
-                for (const sib of siblings) {
+                for (const sib of Array.from(el.parentElement.children)) {
                     const t = sib.textContent.toLowerCase().trim();
                     if (t.length > 200) continue;
                     if (t.includes('tool invoked')) return true;
@@ -548,7 +589,6 @@
                 el = el.parentElement;
             }
         } catch(e) {}
-
         return false;
     }
 
@@ -559,49 +599,34 @@
             if (target.htmlFor) { const r = document.getElementById(target.htmlFor); if (r) return r; }
             const inner = target.querySelector('input[type="radio"]'); if (inner) return inner;
         }
-        const parentLabel = target.closest('label');
-        if (parentLabel) {
-            if (parentLabel.htmlFor) { const r = document.getElementById(parentLabel.htmlFor); if (r) return r; }
-            const inner = parentLabel.querySelector('input[type="radio"]'); if (inner) return inner;
+        const pl = target.closest('label');
+        if (pl) {
+            if (pl.htmlFor) { const r = document.getElementById(pl.htmlFor); if (r) return r; }
+            const inner = pl.querySelector('input[type="radio"]'); if (inner) return inner;
         }
-        const radioDiv = target.closest('.radio-option, .radio-group, [class*="radio"], [class*="Radio"]');
-        if (radioDiv) { const r = radioDiv.querySelector('input[type="radio"]'); if (r) return r; }
+        const rd = target.closest('.radio-option, .radio-group, [class*="radio"], [class*="Radio"]');
+        if (rd) { const r = rd.querySelector('input[type="radio"]'); if (r) return r; }
         return null;
     }
-
-    function isToolInvokedTarget(target) {
-        const radio = extractRadio(target);
-        return radio ? isToolInvokedInaccurate(radio) : false;
-    }
+    function isToolInvokedTarget(target) { const r = extractRadio(target); return r ? isToolInvokedInaccurate(r) : false; }
 
     function getDetectedHVA() {
-        const selects = document.querySelectorAll('select');
-        for (const sel of selects) {
-            const nameOrId = (sel.name || sel.id || '').toLowerCase();
+        for (const sel of document.querySelectorAll('select')) {
+            const ni = (sel.name || sel.id || '').toLowerCase();
             const val = (sel.value || sel.options[sel.selectedIndex]?.text || '').toLowerCase();
-            if (!val || val.startsWith('select')) continue;
-            if (!nameOrId.includes('hva') && !nameOrId.includes('category')) continue;
-            for (const entry of HVA_KEYWORD_MAP) {
-                if (entry.keywords.some(kw => val.includes(kw))) return entry.category;
-            }
+            if (!val || val.startsWith('select') || (!ni.includes('hva') && !ni.includes('category'))) continue;
+            for (const e of HVA_KEYWORD_MAP) if (e.keywords.some(k => val.includes(k))) return e.category;
         }
-        const labelEls = [...document.querySelectorAll('label,span,p,div,h3,h4,h5,legend,th,td')];
-        for (const lbl of labelEls) {
+        for (const lbl of document.querySelectorAll('label,span,p,div,h3,h4,h5,legend,th,td')) {
             const lt = lbl.textContent.trim().toLowerCase();
-            if (lt.length > 80) continue;
-            if (!lt.includes('hva') && !lt.includes('category')) continue;
+            if (lt.length > 80 || (!lt.includes('hva') && !lt.includes('category'))) continue;
             let container = lbl.parentElement;
             for (let i = 0; i < 6; i++) {
                 if (!container || container.tagName === 'BODY') break;
-                const triggers = [...container.querySelectorAll(
-                    'button,[role="combobox"],[role="listbox"],[aria-haspopup],[class*="select"],[class*="Select"],[class*="dropdown"],[class*="Dropdown"]'
-                )];
-                for (const t of triggers) {
+                for (const t of container.querySelectorAll('button,[role="combobox"],[role="listbox"],[aria-haspopup],[class*="select"],[class*="Select"],[class*="dropdown"],[class*="Dropdown"]')) {
                     const tv = t.textContent.trim().toLowerCase();
                     if (!tv || tv.startsWith('select') || tv.length > 80) continue;
-                    for (const entry of HVA_KEYWORD_MAP) {
-                        if (entry.keywords.some(kw => tv.includes(kw))) return entry.category;
-                    }
+                    for (const e of HVA_KEYWORD_MAP) if (e.keywords.some(k => tv.includes(k))) return e.category;
                 }
                 container = container.parentElement;
             }
@@ -610,62 +635,28 @@
     }
 
     function findExpectedToolField() {
-        const attrSelectors = [
-            '[name="expected_tool_invocation"]','[name="expected-tool-invocation"]','[name="expectedToolInvocation"]',
-            '[name="expected_tool"]','[name="expected-tool"]','[name="tool_invocation"]','[name="tool-invocation"]',
-            '[id="expected_tool_invocation"]','[id="expected-tool-invocation"]','[id="expectedToolInvocation"]',
-            '[id="expected_tool"]','[id="expected-tool"]','[id="tool_invocation"]','[id="tool-invocation"]',
-            '[name*="expected_tool" i]','[name*="expected-tool" i]','[id*="expected_tool" i]','[id*="expected-tool" i]',
-            '[name*="tool_invoc" i]','[id*="tool_invoc" i]',
-        ];
-        for (const sel of attrSelectors) {
-            try { const el = document.querySelector(sel); if (el && el.offsetParent !== null) { console.log('[TI Filler] Found via:', sel); return el; } } catch(e) {}
+        const attr = ['[name="expected_tool_invocation"]','[name="expected-tool-invocation"]','[name="expectedToolInvocation"]','[name="expected_tool"]','[name="expected-tool"]','[name="tool_invocation"]','[name="tool-invocation"]','[id="expected_tool_invocation"]','[id="expected-tool-invocation"]','[id="expectedToolInvocation"]','[id="expected_tool"]','[id="expected-tool"]','[id="tool_invocation"]','[id="tool-invocation"]','[name*="expected_tool" i]','[name*="expected-tool" i]','[id*="expected_tool" i]','[id*="expected-tool" i]','[name*="tool_invoc" i]','[id*="tool_invoc" i]'];
+        for (const s of attr) { try { const el = document.querySelector(s); if (el && el.offsetParent !== null) return el; } catch(e) {} }
+        const ph = ['textarea[placeholder*="expected tool" i]','input[placeholder*="expected tool" i]','textarea[placeholder*="tool invoc" i]','input[placeholder*="tool invoc" i]','textarea[placeholder*="tool should" i]','input[placeholder*="tool should" i]'];
+        for (const s of ph) { const el = document.querySelector(s); if (el && el.offsetParent !== null) return el; }
+        const kw = ['expected tool invocation','expected tool','expected_tool','tool invocation','tool should have','correct tool'];
+        for (const el of document.querySelectorAll('label, span, p, div, h3, h4, h5, h6, legend, th, td')) {
+            const t = el.textContent.trim().toLowerCase();
+            if (t.length > 100 || !kw.some(k => t.includes(k))) continue;
+            let p = el.parentElement;
+            for (let i = 0; i < 8; i++) { if (!p) break; const f = p.querySelector('textarea, input[type="text"], input:not([type])'); if (f && f.offsetParent !== null) return f; p = p.parentElement; }
         }
-        const placeholderSelectors = [
-            'textarea[placeholder*="expected tool" i]','input[placeholder*="expected tool" i]',
-            'textarea[placeholder*="tool invoc" i]','input[placeholder*="tool invoc" i]',
-            'textarea[placeholder*="tool should" i]','input[placeholder*="tool should" i]',
-        ];
-        for (const sel of placeholderSelectors) {
-            const el = document.querySelector(sel);
-            if (el && el.offsetParent !== null) { console.log('[TI Filler] Found via placeholder:', sel); return el; }
-        }
-        const labelKeywords = ['expected tool invocation','expected tool','expected_tool','tool invocation','tool should have','correct tool'];
-        const allEls = document.querySelectorAll('label, span, p, div, h3, h4, h5, h6, legend, th, td');
-        for (const el of allEls) {
-            const text = el.textContent.trim().toLowerCase();
-            if (text.length > 100) continue;
-            if (labelKeywords.some(kw => text.includes(kw))) {
-                let parent = el.parentElement;
-                for (let i = 0; i < 8; i++) {
-                    if (!parent) break;
-                    const field = parent.querySelector('textarea, input[type="text"], input:not([type])');
-                    if (field && field.offsetParent !== null) { console.log('[TI Filler] Found via label:', text); return field; }
-                    parent = parent.parentElement;
-                }
-            }
-        }
-        console.warn('[TI Filler] Field not found. Visible fields:');
-        document.querySelectorAll('textarea, input[type="text"]').forEach(f => {
-            if (f.offsetParent !== null) console.warn('  ->', f.tagName, '| name:', f.name||'(none)', '| id:', f.id||'(none)', '| placeholder:', f.placeholder||'(none)');
-        });
         return null;
     }
 
     function getVisibleFieldsDebugText() {
-        const fields = [];
-        document.querySelectorAll('textarea, input[type="text"], input:not([type])').forEach(f => {
-            if (f.offsetParent !== null)
-                fields.push('tag: ' + f.tagName.toLowerCase() + ' | name: "' + (f.name||'') + '" | id: "' + (f.id||'') + '" | placeholder: "' + (f.placeholder||'') + '"');
-        });
-        return fields.length ? fields.join('\n') : 'No visible text fields found on page';
+        const f = []; document.querySelectorAll('textarea, input[type="text"], input:not([type])').forEach(el => { if (el.offsetParent !== null) f.push('tag: ' + el.tagName.toLowerCase() + ' | name: "' + (el.name||'') + '" | id: "' + (el.id||'') + '" | placeholder: "' + (el.placeholder||'') + '"'); });
+        return f.length ? f.join('\n') : 'No visible text fields found on page';
     }
 
     function renderStep1() {
         const detectedHVA = getDetectedHVA();
-        const hvaNote = detectedHVA
-            ? '<div class="ti-hva-detected">HVA Detected: <strong>' + escapeHtml(detectedHVA) + '</strong> - relevant tools highlighted in Step 2</div>'
-            : '';
+        const hvaNote = detectedHVA ? '<div class="ti-hva-detected">HVA Detected: <strong>' + escapeHtml(detectedHVA) + '</strong> - relevant tools highlighted in Step 2</div>' : '';
         picker.innerHTML =
             '<div class="ti-header"><h3>Tool Invoked - Inaccurate</h3><div class="ti-step-label">Step 1 - What happened?</div></div>' +
             '<div class="ti-body">' + hvaNote +
@@ -676,35 +667,16 @@
             '<div class="ti-opt-row"><button class="ti-opt ti-opt-debug" id="ti-debug-btn">Show all fields on this page<br/><small style="font-weight:normal;color:inherit;opacity:0.8;">Use this if filling is not working</small></button></div>' +
             '<button class="ti-cancel">Cancel</button></div>';
         picker.querySelector('#ti-wrong-tool-btn').addEventListener('click', () => renderStep2(detectedHVA));
-        picker.querySelector('#ti-kb-tool-btn').addEventListener('click', () => {
-            const field = findExpectedToolField(); hidePicker();
-            setTimeout(() => {
-                if (field) { smartFill(field, 'search_amazon_business_knowledge_base'); showToast('Filled: search_amazon_business_knowledge_base'); }
-                else showToast('Field not found - click Show all fields to debug');
-            }, 400);
-        });
-        picker.querySelector('#ti-dpq-btn').addEventListener('click', () => {
-            const field = findExpectedToolField(); hidePicker();
-            setTimeout(() => {
-                if (field) { smartFill(field, 'No'); showToast('Filled: No'); }
-                else showToast('Field not found - click Show all fields to debug');
-            }, 400);
-        });
+        picker.querySelector('#ti-kb-tool-btn').addEventListener('click', () => { const field = findExpectedToolField(); hidePicker(); setTimeout(() => { if (field) { smartFill(field, 'search_amazon_business_knowledge_base'); showToast('Filled: search_amazon_business_knowledge_base'); } else showToast('Field not found - click Show all fields to debug'); }, 400); });
+        picker.querySelector('#ti-dpq-btn').addEventListener('click', () => { const field = findExpectedToolField(); hidePicker(); setTimeout(() => { if (field) { smartFill(field, 'No'); showToast('Filled: No'); } else showToast('Field not found - click Show all fields to debug'); }, 400); });
         picker.querySelector('#ti-debug-btn').addEventListener('click', renderDebugStep);
         picker.querySelector('.ti-cancel').addEventListener('click', hidePicker);
     }
 
     function renderDebugStep() {
-        const debugText = getVisibleFieldsDebugText();
-        picker.innerHTML =
-            '<div class="ti-header"><h3>Field Debug Info</h3><div class="ti-step-label">All visible text fields on this page</div></div>' +
-            '<div class="ti-body"><div style="font-size:12px;color:#555;margin-bottom:8px;">Copy everything below and share it.</div>' +
-            '<div class="ti-debug-box">' + escapeHtml(debugText) + '</div>' +
-            '<div class="ti-opt-row" style="margin-top:8px;"><button class="ti-opt" id="ti-copy-debug-btn" style="border-left-color:#7c3aed;">Copy to Clipboard</button></div>' +
-            '<button class="ti-back">Back</button><button class="ti-cancel">Cancel</button></div>';
-        picker.querySelector('#ti-copy-debug-btn').addEventListener('click', () => {
-            navigator.clipboard.writeText(debugText).then(() => showToast('Copied! Paste this in chat.')).catch(() => showToast('Could not copy - select text manually'));
-        });
+        const dt = getVisibleFieldsDebugText();
+        picker.innerHTML = '<div class="ti-header"><h3>Field Debug Info</h3><div class="ti-step-label">All visible text fields on this page</div></div><div class="ti-body"><div style="font-size:12px;color:#555;margin-bottom:8px;">Copy everything below and share it.</div><div class="ti-debug-box">' + escapeHtml(dt) + '</div><div class="ti-opt-row" style="margin-top:8px;"><button class="ti-opt" id="ti-copy-debug-btn" style="border-left-color:#7c3aed;">Copy to Clipboard</button></div><button class="ti-back">Back</button><button class="ti-cancel">Cancel</button></div>';
+        picker.querySelector('#ti-copy-debug-btn').addEventListener('click', () => { navigator.clipboard.writeText(dt).then(() => showToast('Copied!')).catch(() => showToast('Could not copy - select text manually')); });
         picker.querySelector('.ti-back').addEventListener('click', renderStep1);
         picker.querySelector('.ti-cancel').addEventListener('click', hidePicker);
     }
@@ -712,141 +684,68 @@
     function renderStep2(detectedHVA) {
         const matchedTools = (detectedHVA && TOOL_MAP[detectedHVA]) ? TOOL_MAP[detectedHVA] : [];
         const remainingTools = ALL_TOOLS.filter(t => !matchedTools.includes(t));
-        let html = '<div class="ti-header"><h3>Expected Tool</h3><div class="ti-step-label">Step 2 - Select the tool that should have been called</div></div>' +
-            '<div class="ti-body"><input type="text" class="ti-search" placeholder="Search tool name..." />';
+        let html = '<div class="ti-header"><h3>Expected Tool</h3><div class="ti-step-label">Step 2 - Select the tool that should have been called</div></div><div class="ti-body"><input type="text" class="ti-search" placeholder="Search tool name..." />';
         if (matchedTools.length > 0) {
             html += '<div class="ti-section-label">Likely for ' + escapeHtml(detectedHVA) + '</div>';
-            matchedTools.forEach(tool => {
-                const desc = TOOL_DESCRIPTIONS[tool] || '';
-                html += '<div class="ti-opt-row" data-search="' + escapeHtml((tool+' '+desc).toLowerCase()) + '">' +
-                    '<button class="ti-opt ti-opt-tool-match ti-tool-btn" data-tool="' + escapeHtml(tool) + '">' + escapeHtml(tool) +
-                    (desc ? '<br/><small style="font-weight:normal;font-family:Arial;font-size:11px;opacity:0.8;">' + escapeHtml(desc) + '</small>' : '') +
-                    '</button></div>';
-            });
+            matchedTools.forEach(tool => { const desc = TOOL_DESCRIPTIONS[tool] || ''; html += '<div class="ti-opt-row" data-search="' + escapeHtml((tool+' '+desc).toLowerCase()) + '"><button class="ti-opt ti-opt-tool-match ti-tool-btn" data-tool="' + escapeHtml(tool) + '">' + escapeHtml(tool) + (desc ? '<br/><small style="font-weight:normal;font-family:Arial;font-size:11px;opacity:0.8;">' + escapeHtml(desc) + '</small>' : '') + '</button></div>'; });
         }
         html += '<div class="ti-section-label">' + (matchedTools.length > 0 ? 'All Other Tools' : 'All Tools') + '</div>';
-        remainingTools.forEach(tool => {
-            const desc = TOOL_DESCRIPTIONS[tool] || '';
-            html += '<div class="ti-opt-row" data-search="' + escapeHtml((tool+' '+desc).toLowerCase()) + '">' +
-                '<button class="ti-opt ti-opt-tool ti-tool-btn" data-tool="' + escapeHtml(tool) + '">' + escapeHtml(tool) +
-                (desc ? '<br/><small style="font-weight:normal;font-family:Arial;font-size:11px;opacity:0.8;">' + escapeHtml(desc) + '</small>' : '') +
-                '</button></div>';
-        });
-        const savedCustomTools = getCustomTools();
-        html += '<div class="ti-section-label">Custom Tool</div>' +
-            '<div style="padding:0 0 6px;"><input type="text" id="ti-custom-tool-input" class="ti-search" placeholder="Type any tool name..." style="margin-bottom:6px;" />' +
-            '<div style="display:flex;gap:8px;">' +
-            '<button id="ti-custom-fill-btn" style="flex:1;padding:9px 14px;background:#FF9900;color:#131921;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">Fill Now</button>' +
-            '<button id="ti-custom-save-btn" style="flex:1;padding:9px 14px;background:#131921;color:#FF9900;border:1.5px solid #FF9900;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">Save &amp; Fill</button>' +
-            '</div></div>';
-        if (savedCustomTools.length > 0) {
-            html += '<div class="ti-section-label">Saved Custom Tools</div>';
-            savedCustomTools.forEach(tool => {
-                html += '<div class="ti-opt-row" data-search="' + escapeHtml(tool.toLowerCase()) + '">' +
-                    '<button class="ti-opt ti-opt-tool ti-tool-btn" data-tool="' + escapeHtml(tool) + '">' + escapeHtml(tool) + '</button>' +
-                    '<button class="ti-del-custom-btn" data-del="' + escapeHtml(tool) + '" style="padding:7px 10px;background:#cc0000;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;flex-shrink:0;">X</button>' +
-                    '</div>';
-            });
-        }
+        remainingTools.forEach(tool => { const desc = TOOL_DESCRIPTIONS[tool] || ''; html += '<div class="ti-opt-row" data-search="' + escapeHtml((tool+' '+desc).toLowerCase()) + '"><button class="ti-opt ti-opt-tool ti-tool-btn" data-tool="' + escapeHtml(tool) + '">' + escapeHtml(tool) + (desc ? '<br/><small style="font-weight:normal;font-family:Arial;font-size:11px;opacity:0.8;">' + escapeHtml(desc) + '</small>' : '') + '</button></div>'; });
+        const saved = getCustomTools();
+        html += '<div class="ti-section-label">Custom Tool</div><div style="padding:0 0 6px;"><input type="text" id="ti-custom-tool-input" class="ti-search" placeholder="Type any tool name..." style="margin-bottom:6px;" /><div style="display:flex;gap:8px;"><button id="ti-custom-fill-btn" style="flex:1;padding:9px 14px;background:#FF9900;color:#131921;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">Fill Now</button><button id="ti-custom-save-btn" style="flex:1;padding:9px 14px;background:#131921;color:#FF9900;border:1.5px solid #FF9900;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">Save &amp; Fill</button></div></div>';
+        if (saved.length > 0) { html += '<div class="ti-section-label">Saved Custom Tools</div>'; saved.forEach(tool => { html += '<div class="ti-opt-row" data-search="' + escapeHtml(tool.toLowerCase()) + '"><button class="ti-opt ti-opt-tool ti-tool-btn" data-tool="' + escapeHtml(tool) + '">' + escapeHtml(tool) + '</button><button class="ti-del-custom-btn" data-del="' + escapeHtml(tool) + '" style="padding:7px 10px;background:#cc0000;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;flex-shrink:0;">X</button></div>'; }); }
         html += '<button class="ti-back">Back</button><button class="ti-cancel">Cancel</button></div>';
         picker.innerHTML = html;
-        const searchBox = picker.querySelector('.ti-search');
-        if (searchBox) {
-            searchBox.addEventListener('input', function () {
-                const q = this.value.toLowerCase();
-                picker.querySelectorAll('.ti-opt-row').forEach(row => row.classList.toggle('ti-hide', !row.dataset.search.includes(q)));
-            });
-        }
-        picker.querySelectorAll('.ti-tool-btn').forEach(btn => {
-            btn.addEventListener('click', function () {
-                const tool = this.dataset.tool;
-                const field = findExpectedToolField(); hidePicker();
-                setTimeout(() => {
-                    if (field) { smartFill(field, tool); showToast('Expected Tool Invocation filled!'); }
-                    else showToast('Field not found - use Show all fields to debug');
-                }, 400);
-            });
-        });
-        const customInput = picker.querySelector('#ti-custom-tool-input');
-        const fillNowBtn  = picker.querySelector('#ti-custom-fill-btn');
-        const saveBtn     = picker.querySelector('#ti-custom-save-btn');
-        function fillCustom(save) {
-            const val = customInput ? customInput.value.trim() : '';
-            if (!val) { showToast('Please type a tool name first!'); return; }
-            if (save) { const existing = getCustomTools(); if (!existing.includes(val)) { existing.push(val); saveCustomTools(existing); } }
-            const field = findExpectedToolField(); hidePicker();
-            setTimeout(() => {
-                if (field) { smartFill(field, val); showToast(save ? 'Saved & filled!' : 'Expected Tool Invocation filled!'); }
-                else showToast('Field not found - use Show all fields to debug');
-            }, 400);
-        }
-        if (fillNowBtn) fillNowBtn.addEventListener('click', () => fillCustom(false));
-        if (saveBtn) saveBtn.addEventListener('click', () => fillCustom(true));
-        if (customInput) {
-            customInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); fillCustom(false); } });
-            setTimeout(() => customInput.focus(), 100);
-        }
-        picker.querySelectorAll('.ti-del-custom-btn').forEach(btn => {
-            btn.addEventListener('click', function(e) {
-                e.stopPropagation();
-                saveCustomTools(getCustomTools().filter(t => t !== this.dataset.del));
-                showToast('Deleted custom tool'); renderStep2(detectedHVA);
-            });
-        });
+        const sb = picker.querySelector('.ti-search');
+        if (sb) sb.addEventListener('input', function () { const q = this.value.toLowerCase(); picker.querySelectorAll('.ti-opt-row').forEach(row => row.classList.toggle('ti-hide', !row.dataset.search.includes(q))); });
+        picker.querySelectorAll('.ti-tool-btn').forEach(btn => { btn.addEventListener('click', function () { const tool = this.dataset.tool; const field = findExpectedToolField(); hidePicker(); setTimeout(() => { if (field) { smartFill(field, tool); showToast('Expected Tool Invocation filled!'); } else showToast('Field not found - use Show all fields to debug'); }, 400); }); });
+        const ci = picker.querySelector('#ti-custom-tool-input'), fn = picker.querySelector('#ti-custom-fill-btn'), sv = picker.querySelector('#ti-custom-save-btn');
+        function fillCustom(save) { const val = ci ? ci.value.trim() : ''; if (!val) { showToast('Please type a tool name first!'); return; } if (save) { const ex = getCustomTools(); if (!ex.includes(val)) { ex.push(val); saveCustomTools(ex); } } const field = findExpectedToolField(); hidePicker(); setTimeout(() => { if (field) { smartFill(field, val); showToast(save ? 'Saved & filled!' : 'Expected Tool Invocation filled!'); } else showToast('Field not found'); }, 400); }
+        if (fn) fn.addEventListener('click', () => fillCustom(false));
+        if (sv) sv.addEventListener('click', () => fillCustom(true));
+        if (ci) { ci.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); fillCustom(false); } }); setTimeout(() => ci.focus(), 100); }
+        picker.querySelectorAll('.ti-del-custom-btn').forEach(btn => { btn.addEventListener('click', function(e) { e.stopPropagation(); saveCustomTools(getCustomTools().filter(t => t !== this.dataset.del)); showToast('Deleted custom tool'); renderStep2(detectedHVA); }); });
         picker.querySelector('.ti-back').addEventListener('click', renderStep1);
         picker.querySelector('.ti-cancel').addEventListener('click', hidePicker);
     }
 
-    let lastTriggerTime = 0;
-    const DEBOUNCE_MS = 2500;
-
-    function tryOpen() {
-        const now = Date.now();
-        if (now - lastTriggerTime < DEBOUNCE_MS) return;
-        if (pickerBusy) return;
-        lastTriggerTime = now;
-        showPicker();
+    // AWSUI [role="radio"] support: extractRadio only finds native radios, so on abc-mlops
+    // we need a separate check for AWSUI divs styled as radio buttons.
+    function isAwsuiToolInvokedInaccurate(el) {
+        const radioEl = (el.getAttribute && el.getAttribute('role') === 'radio') ? el : el.closest && el.closest('[role="radio"]');
+        if (!radioEl || !radioEl.offsetParent) return false;
+        const label = (radioEl.getAttribute('aria-label') || radioEl.textContent || '').trim().toLowerCase();
+        if (!label.includes('inaccurate')) return false;
+        let parent = radioEl.parentElement;
+        for (let i = 0; i < 15; i++) {
+            if (!parent || parent === document.body) break;
+            const txt = parent.textContent.toLowerCase();
+            if (txt.includes('tool invoked') && txt.length < 600) return true;
+            parent = parent.parentElement;
+        }
+        return false;
     }
 
-    document.addEventListener('click', function (e) {
-        if (pickerBusy) return; if (picker.contains(e.target)) return;
-        if (isToolInvokedTarget(e.target)) tryOpen();
-    }, true);
-
-    document.addEventListener('change', function (e) {
-        if (pickerBusy) return; if (picker.contains(e.target)) return;
-        const t = e.target;
-        if (t.type === 'radio' && t.checked && isToolInvokedTarget(t)) tryOpen();
-    }, true);
+    let lastTriggerTime = 0; const DEBOUNCE_MS = 2500;
+    function tryOpen() { const now = Date.now(); if (now - lastTriggerTime < DEBOUNCE_MS || pickerBusy) return; lastTriggerTime = now; showPicker(); }
+    document.addEventListener('click', function (e) { if (pickerBusy || picker.contains(e.target) || window.__orbitHEFilling) return; if (isToolInvokedTarget(e.target) || isAwsuiToolInvokedInaccurate(e.target)) tryOpen(); }, true);
+    document.addEventListener('change', function (e) { if (pickerBusy || picker.contains(e.target) || window.__orbitHEFilling) return; const t = e.target; if (t.type === 'radio' && t.checked && isToolInvokedTarget(t)) tryOpen(); }, true);
 
     function smartFill(field, value) {
         field.focus(); field.click();
         setTimeout(() => {
             const proto = field.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
-            const nativeSet = Object.getOwnPropertyDescriptor(proto, 'value').set;
-            nativeSet.call(field, '');
-            field.dispatchEvent(new Event('input', { bubbles: true }));
-            field.dispatchEvent(new Event('change', { bubbles: true }));
-            setTimeout(() => {
-                nativeSet.call(field, value);
-                field.dispatchEvent(new Event('input', { bubbles: true }));
-                field.dispatchEvent(new Event('change', { bubbles: true }));
-                setTimeout(() => { field.dispatchEvent(new Event('blur', { bubbles: true })); }, 200);
-            }, 100);
-        }, 100);
+            const ns = Object.getOwnPropertyDescriptor(proto, 'value').set;
+            ns.call(field, ''); field.dispatchEvent(new Event('input', { bubbles: true })); field.dispatchEvent(new Event('change', { bubbles: true }));
+            setTimeout(() => { ns.call(field, value); field.dispatchEvent(new Event('input', { bubbles: true })); field.dispatchEvent(new Event('change', { bubbles: true })); setTimeout(() => { field.dispatchEvent(new Event('blur', { bubbles: true })); }, 80); }, 30);
+        }, 30);
     }
 
-    function showToast(msg) {
-        const t = document.createElement('div');
-        t.className = 'ti-toast'; t.textContent = msg;
-        document.body.appendChild(t);
-        setTimeout(() => { t.style.opacity = '0'; t.style.transition = 'opacity 0.3s'; setTimeout(() => t.remove(), 300); }, 4000);
-    }
+    function showToast(msg) { const t = document.createElement('div'); t.className = 'ti-toast'; t.textContent = msg; document.body.appendChild(t); setTimeout(() => { t.style.opacity = '0'; t.style.transition = 'opacity 0.3s'; setTimeout(() => t.remove(), 300); }, 4000); }
 
-    document.addEventListener('keydown', (e) => {
-        if (e.ctrlKey && e.shiftKey && e.key === 'T') { e.preventDefault(); showPicker(); }
-    });
+    document.addEventListener('keydown', (e) => { if (e.ctrlKey && e.shiftKey && e.key === 'T') { e.preventDefault(); showPicker(); } });
 
-    console.log('[Tool Invoked Clippings v4.0.0] Loaded');
+    window.__orbitCombinedVersion = '4.2.6';
+    console.log('[Orbit Combined v4.2.6] Loaded — HE fill guard prevents TI picker conflict');
 
 })();
