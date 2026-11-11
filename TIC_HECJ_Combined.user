@@ -1,11 +1,12 @@
 // ==UserScript==
-// @name         New Tool Invoked clippings
+// @name         HECJ+Tool Invoked clippings
 // @namespace    http://tampermonkey.net/
-// @version      4.5.0
+// @version      4.5.8
 // @description  HE Cannot Judge widget + TI Clippings. isToolInvokedInChat: v4.5.0: new tools — AB Payments, PBI payments, punchout/MLE docs
 // @match        https://orbit-gamma.beta.harmony.a2z.com/*
 // @match        https://orbit-beta.beta.harmony.a2z.com/*
 // @match        https://abc-mlops.beta.harmony.a2z.com/reviewer*
+// @match        https://abc-mlops.harmony.a2z.com/reviewer*
 // @run-at       document-idle
 // @grant        GM_addStyle
 // ==/UserScript==
@@ -38,8 +39,8 @@
     return btn;
   }
 
-  function showFeedback(btn, success) {
-    btn.textContent = success ? '\u2713 Done' : '\u26a0 Check fields';
+  function showFeedback(btn, success, msg) {
+    btn.textContent = success ? '\u2713 Done' : (msg || '\u26a0 Check fields');
     btn.style.background = success ? '#14532d' : '#7f1d1d';
     btn.style.borderColor = success ? '#22c55e' : '#ef4444';
     btn.dataset.active = 'true';
@@ -47,7 +48,7 @@
       btn.textContent = '\u{1F6AB} Human Evaluator - Cannot Judge';
       btn.style.background = '#1e293b'; btn.style.borderColor = '#475569';
       delete btn.dataset.active;
-    }, 2500);
+    }, success ? 2500 : 6000);
   }
 
   function getRadioLabel(radio) {
@@ -268,11 +269,10 @@
     );
   }
 
-  function openAndSelectHE(trigger, btn) {
+  function openAndSelectHE(trigger, btn, waitMs) {
     return new Promise((resolve) => {
       const heBtn = document.getElementById('orbit-he-btn');
       const obs = new MutationObserver((mutations) => {
-        if (btn && !btn.isConnected) { obs.disconnect(); clearTimeout(timer); resolve(false); return; }
         for (const mutation of mutations) {
           for (const node of mutation.addedNodes) {
             if (node.nodeType !== 1) continue;
@@ -300,7 +300,7 @@
         obs.disconnect();
         document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
         resolve(false);
-      }, 50);
+      }, waitMs || 50);
       trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
       trigger.click(); trigger.focus();
     });
@@ -348,20 +348,34 @@
     }
     if (uiFallbacks.length > 0) injectSuppressStyle();
     for (const trigger of uiFallbacks) {
-      if (!btn.isConnected) { removeSuppressStyle(); return; }
       await openAndSelectHE(trigger, btn);
     }
+    // Retry pass: any dropdown still showing its "Select..." placeholder (e.g. HVA Category,
+    // whose long list renders slowly or whose fiber lookup gave a false 'no HE') gets a slower UI attempt.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const pending = getDropdownTriggers().filter(t => /^Select/i.test(t.textContent.trim()));
+      if (!pending.length) break;
+      injectSuppressStyle();
+      for (const trigger of pending) {
+        const ok = await openAndSelectHE(trigger, btn, 500 + attempt * 500);
+        if (!ok) console.warn('[HE widget] could not select Human Evaluator in dropdown:', trigger.textContent.trim());
+        await new Promise(r => setTimeout(r, 150));
+      }
+    }
     removeSuppressStyle();
-    if (!btn.isConnected) return;
     // Second radio pass: only wait if UI-fallback dropdowns needed opening;
     // if everything resolved via React fiber (or no dropdowns at all) skip the delay.
     if (uiFallbacks.length > 0) await new Promise(r => setTimeout(r, 100));
     setRadios();
-    // Show Done immediately -- all visible fields are filled.
-    // Then after 400ms, silently override Context Switch so we win against
-    // Auto Context Switch v6.2 (which fires asynchronously after our fill).
-    btn.disabled = false; showFeedback(btn, true);
-    setTimeout(() => { window.__orbitHEFilling = false; if (btn.isConnected) setContextSwitchHE(); }, 450);
+    // Report anything still unfilled instead of always saying Done.
+    const left = getDropdownTriggers().filter(t => /^Select/i.test(t.textContent.trim()));
+    btn.disabled = false;
+    const live = document.getElementById('orbit-he-btn') || btn;
+    if (left.length) {
+      console.warn('[HE widget] still unfilled:', left.map(t => t.textContent.trim()));
+      showFeedback(live, false, '\u26a0 ' + left.length + ' not filled: ' + left.map(t => t.textContent.trim().replace(/^Select\s*/i,'').replace(/\.+$/,'')).join(', '));
+    } else showFeedback(live, true);
+    setTimeout(() => { window.__orbitHEFilling = false; }, 450);
   }
 
   function injectButton() {
@@ -372,6 +386,11 @@
     for (const p of PATTERNS) {
       labelEl = allEls.find(el => [...el.childNodes].filter(n => n.nodeType===3).map(n=>n.textContent.trim()).join('').includes(p));
       if (labelEl) break;
+    }
+    if (!labelEl) {
+      // Tool Invoked Accurate heading (text may be split across highlight spans) - pick deepest match
+      const tiMatches = allEls.filter(el => /^tool invoked accurate\s*\*?$/i.test(el.textContent.trim()));
+      labelEl = tiMatches.find(el => !tiMatches.some(o => o !== el && el.contains(o))) || null;
     }
     if (!labelEl) {
       // Native radio fallback
@@ -411,47 +430,75 @@
     'use strict';
 
     const TOOL_MAP = {
-        'Your Orders':                ['get_orders_information','get_orders'],
+        'Your Orders':                ['get_orders_information','get_orders_info'],
         'Approvals':                  ['diagnose_approval_execution','get_approval_delegations','get_approval_notifications'],
         'Tax Exemption (ATEP)':       ['diagnose_tax_exemption_issue','get_atep_checkout_configuration','get_enrollment_status','get_exemption_assignment_snapshot','list_exemptions'],
-        'Guided Buying':              ['GBQuery_POC','GBGetPolicies','GBListApplicablePolicies','GBListAvailableTemplates'],
+        'Guided Buying':              ['explain_guided_buying_policy_behavior','explain_guided_buying_priorities','get_guided_buying_policies','list_applicable_guided_buying_policies','list_available_guided_buying_templates'],
         'Savings Agent':              ['get_savings_recommendation'],
+        'Analytics & Reporting':      ['aggregate_purchasing_data'],
         'Spend Anomaly Monitoring':   ['get_spend_anomaly_reviews','get_spend_anomaly_recommendations'],
         'Business Order Information': ['diagnose_custom_order_fields'],
         'Pay By Invoice / BCA':       ['get_pay_by_invoice_account_summary','get_pay_by_invoice_transactions'],
         'KB / Feature Queries':       ['search_amazon_business_knowledge_base','search_ab_documentation','read_ab_documentation'],
-        'AB Payments':                    ['get_available_payment_methods','get_amazon_card_benefits'],
+        'AB Payments':                    ['get_available_payment_methods','get_amazon_card_benefits','get_rewards_balance','search_payment_transactions','lookup_statement_charge'],
         'Pay By Invoice / BCA (Payments)':['get_pay_by_invoice_payment_allocation'],
     };
 
     const ALL_TOOLS = [
-        'diagnose_approval_execution','diagnose_custom_order_fields','diagnose_tax_exemption_issue',
-        'GBGetPolicies','GBListApplicablePolicies','GBListAvailableTemplates','GBQuery_POC',
-        'get_approval_delegations','get_approval_notifications','get_atep_checkout_configuration',
-        'get_amazon_card_benefits','get_available_payment_methods',
-        'get_current_time','get_enrollment_status','get_exemption_assignment_snapshot',
-        'get_orders','get_orders_information',
-        'get_pay_by_invoice_account_summary','get_pay_by_invoice_payment_allocation','get_pay_by_invoice_transactions',
-        'get_savings_recommendation','get_spend_anomaly_recommendations','get_spend_anomaly_reviews',
-        'list_exemptions','read_ab_documentation',
-        'search_ab_documentation','search_amazon_business_knowledge_base',
+        'aggregate_purchasing_data',
+        'diagnose_approval_execution',
+        'diagnose_custom_order_fields',
+        'diagnose_tax_exemption_issue',
+        'explain_guided_buying_policy_behavior',
+        'explain_guided_buying_priorities',
+        'get_amazon_card_benefits',
+        'get_approval_delegations',
+        'get_approval_notifications',
+        'get_atep_checkout_configuration',
+        'get_available_payment_methods',
+        'get_current_time',
+        'get_enrollment_status',
+        'get_exemption_assignment_snapshot',
+        'get_guided_buying_policies',
+        'get_orders_info',
+        'get_orders_information',
+        'get_pay_by_invoice_account_summary',
+        'get_pay_by_invoice_payment_allocation',
+        'get_pay_by_invoice_transactions',
+        'get_rewards_balance',
+        'get_savings_recommendation',
+        'get_spend_anomaly_recommendations',
+        'get_spend_anomaly_reviews',
+        'list_applicable_guided_buying_policies',
+        'list_available_guided_buying_templates',
+        'list_exemptions',
+        'lookup_statement_charge',
+        'read_ab_documentation',
+        'search_ab_documentation',
+        'search_amazon_business_knowledge_base',
+        'search_payment_transactions',
     ];
 
     const TOOL_DESCRIPTIONS = {
+        'aggregate_purchasing_data': 'Aggregate metrics over purchasing data (last ~2 yrs) - total/average spend, order/return/unit counts, breakdowns, trends, savings totals. Aggregate only, not individual records',
+        'explain_guided_buying_policy_behavior': 'Conceptual/reasoning Q&A on Guided Buying policy behavior - conflict resolution, matching rules, precedence, misconfigurations. Read-only',
+        'explain_guided_buying_priorities': 'Explains Guided Buying policy type priorities - which policy type wins when several apply to the same product, and why others are superseded',
+        'get_guided_buying_policies': 'Retrieves specific Guided Buying policies by resource policy ID (max 10) - title, intent, description, group, criteria, and view link',
+        'list_applicable_guided_buying_policies': 'Lists and searches the actual Guided Buying policies that apply to a business group - for what / which / list / search questions about concrete policy data',
+        'list_available_guided_buying_templates': 'Lists Guided Buying policy types available for a business group - what policy types can be created based on BP tier, marketplace, credentials',
+        'get_orders_info': 'Retrieves order info (CloudAuth version, weblab T1) - status, items, tracking, returns, refunds, cancellations. Up to 3 recent orders',
+        'get_rewards_balance': 'Current rewards points balance for eligible reward-earning cards - program name, points balance, approximate monetary value',
+        'search_payment_transactions': 'Retrieves and explains payment transactions (charges) - unrecognized, unexpected, duplicate or wrong-amount charges, statement descriptors, amounts, payment reference IDs',
+        'lookup_statement_charge': 'Identifies a specific unrecognized charge on a card/bank statement by date, amount, payment reference or charge ID - returns the charge record and what it was for',
         'diagnose_approval_execution':           'Diagnoses approval execution for an order - status, applied policy, approver, buyer, delegator, checkout group and timeline',
         'diagnose_custom_order_fields':          'Diagnoses Custom Order Fields (COF) / Business Order Information (BOI) - checkout group config, PO number, cost center, GL code, project code',
         'diagnose_tax_exemption_issue':          'Diagnoses why a tax exemption is not applying at checkout - root_cause, severity, explanation, resolution steps, action_url',
-        'GBGetPolicies':                         'Retrieves specific Guided Buying policies by resource policy ID - title, intent, description, group, criteria, and view link',
-        'GBListApplicablePolicies':              'Lists and searches Guided Buying policies that apply to a business group - title, resource policy ID, intent, audit metadata, enriched criteria',
-        'GBListAvailableTemplates':              'Lists Guided Buying policy types available for a business group - what policy types can be created based on BP tier and marketplace',
-        'GBQuery_POC':                           'Read-only Guided Buying query - policy lookup, matching rules, conflict resolution, customer-specific policy analysis',
         'get_approval_delegations':              'Retrieves active approval delegations and history for an approver - delegate assignments, start/end times',
         'get_approval_notifications':            'Retrieves approval notification records for an order - type, recipient, processing time',
         'get_atep_checkout_configuration':       'Returns ATEP account settings and checkout permissions - checkout_behavior, tax_exemption_enabled, opt_out_enabled',
         'get_current_time':                      'Returns current UTC time as ISO8601 - used for date calculations, expiry checks, time-sensitive operations',
         'get_enrollment_status':                 'Checks ATEP enrollment status (ENROLLED / NOT_ENROLLED / PARTIALLY_ENROLLED) - exemption counts by status, jurisdictions, URLs',
         'get_exemption_assignment_snapshot':     'Checks whether tax exemptions apply for a customer at a specific point in time',
-        'get_orders':                            'Retrieves order info via Bedrock AgentCore - status, items, tracking, returns, refunds, cancellations (Weblab C variant)',
         'get_orders_information':                'Retrieves order info via ABOM agent API Gateway - status, items, tracking, returns, refunds, cancellations. Up to 3 recent orders',
         'get_pay_by_invoice_account_summary':    'Returns BCA/PBI account summary - total due, past due, available credit limit, unapplied credits, pending charges, payment terms',
         'get_pay_by_invoice_transactions':       'Returns BCA/PBI transaction history - invoices, credit memos, payments, IDs, statuses, amounts, due dates, days past due',
@@ -659,7 +706,6 @@
         picker.innerHTML =
             '<div class="ti-header"><h3>Tool Invoked - Inaccurate</h3><div class="ti-step-label">Step 1 - What happened?</div></div>' +
             '<div class="ti-body">' + hvaNote +
-            '<div class="ti-opt-row"><button class="ti-opt ti-opt-dpq" id="ti-dpq-btn">Direct product query<br/><small style="font-weight:normal;color:inherit;opacity:0.8;">Fills Expected Tool Invocation: No</small></button></div>' +
             '<div class="ti-opt-row"><button class="ti-opt" id="ti-wrong-tool-btn">Expected tool was not invoked<br/><small style="font-weight:normal;color:inherit;opacity:0.8;">Fills: [expected tool name]</small></button></div>' +
             '<div class="ti-opt-row"><button class="ti-opt ti-opt-kb" id="ti-kb-tool-btn">No tool - KB query (bot gave KB info)<br/><small style="font-weight:normal;color:inherit;opacity:0.8;">Fills: search_amazon_business_knowledge_base</small></button></div>' +
             '<div class="ti-section-label">Troubleshoot</div>' +
@@ -667,7 +713,6 @@
             '<button class="ti-cancel">Cancel</button></div>';
         picker.querySelector('#ti-wrong-tool-btn').addEventListener('click', () => renderStep2(detectedHVA));
         picker.querySelector('#ti-kb-tool-btn').addEventListener('click', () => { hidePicker(); setTimeout(() => { const field = findExpectedToolField(); if (field) { smartFill(field, 'search_amazon_business_knowledge_base'); showToast('Filled: search_amazon_business_knowledge_base'); } else showToast('Field not found - click Show all fields to debug'); }, 500); });
-        picker.querySelector('#ti-dpq-btn').addEventListener('click', () => { hidePicker(); setTimeout(() => { const field = findExpectedToolField(); if (field) { smartFill(field, 'No'); showToast('Filled: No'); } else showToast('Field not found - click Show all fields to debug'); }, 500); });
         picker.querySelector('#ti-debug-btn').addEventListener('click', renderDebugStep);
         picker.querySelector('.ti-cancel').addEventListener('click', hidePicker);
     }
@@ -939,81 +984,7 @@
         if (pickerBusy || picker.contains(e.target) || window.__orbitHEFilling) return;
         const t = e.target;
         if (t.type === 'radio' && t.checked && isToolInvokedTarget(t)) tryOpen();
-        if (isStaticResponseTypeSelect(t) && selectedOptionIsNA(t)) {
-            setTimeout(() => {
-                if (pickerBusy || window.__orbitHEFilling || isToolInvokedInChat()) return;
-                clickToolInvokedInaccurate(); tryOpen();
-            }, 50);
-        }
     }, true);
-
-    // ── Static Response Type watcher ──
-    // Strategy: find the AWSUI Select trigger button for 'Static Response Type',
-    // attach a MutationObserver to watch its text content. When it changes to 'N/A',
-    // auto-click Tool Invoked = Inaccurate and open the picker.
-    // This works regardless of how AWSUI renders its portal or manages option elements.
-    (function () {
-        function onStaticResponseTriggerChange(triggerEl) {
-            const raw = triggerEl.textContent.replace(/\s+/g, '').toLowerCase();
-            console.log('[Orbit v4.5.0] Static Response trigger text:', JSON.stringify(raw));
-            if (raw === 'n/a' || raw === 'na' || raw.startsWith('n/a') || raw.startsWith('na')) {
-                setTimeout(() => {
-                    if (pickerBusy || window.__orbitHEFilling || isToolInvokedInChat()) return;
-                    console.log('[Orbit v4.2.6] Static Response = N/A → opening TI picker');
-                    clickToolInvokedInaccurate();
-                    tryOpen();
-                }, 150);
-            }
-        }
-
-        // findAndWatchTrigger: scans for the Static Response Type trigger button
-        // and attaches a MutationObserver to it if not already watching.
-        // Called on load AND on every annotation re-render (pageObs stays alive).
-        function findAndWatchTrigger() {
-            const allEls = [...document.querySelectorAll(
-                'label,span,div,p,b,strong,legend,h3,h4,h5'
-            )];
-            const labelEl = allEls.find(el => {
-                const own = [...el.childNodes]
-                    .filter(n => n.nodeType === 3)
-                    .map(n => n.textContent.trim()).join(' ').toLowerCase();
-                return own.includes('static response type') || own.includes('static response');
-            });
-            if (!labelEl) return;
-
-            let container = labelEl.parentElement;
-            for (let i = 0; i < 10; i++) {
-                if (!container || container === document.body) break;
-                const triggers = container.querySelectorAll(
-                    'button,[role="combobox"],[aria-haspopup="listbox"],[aria-haspopup="true"]'
-                );
-                for (const trig of triggers) {
-                    if (trig.id === 'orbit-he-btn') continue;
-                    if (trig.textContent.toLowerCase().includes('human evaluator')) continue;
-                    if (trig.__orbitStaticWatched) return; // already attached to this node
-                    trig.__orbitStaticWatched = true;
-                    // New annotation = new button node: reset debounce so picker can open
-                    lastTriggerTime = 0;
-                    console.log('[Orbit v4.2.6] Watching Static Response Type trigger (new node)');
-                    const obs = new MutationObserver(() => onStaticResponseTriggerChange(trig));
-                    obs.observe(trig, { characterData: true, childList: true, subtree: true });
-                    return;
-                }
-                container = container.parentElement;
-            }
-        }
-
-        // pageObs stays alive permanently — annotation panel re-renders on every submission,
-        // creating new DOM nodes. We need to re-attach to the new trigger each time.
-        // Debounced to avoid thrashing on rapid DOM updates.
-        let _watchTimer = null;
-        const pageObs = new MutationObserver(() => {
-            if (_watchTimer) return;
-            _watchTimer = setTimeout(() => { _watchTimer = null; findAndWatchTrigger(); }, 300);
-        });
-        pageObs.observe(document.body, { childList: true, subtree: true });
-        findAndWatchTrigger(); // try immediately on load
-    })();
 
     function smartFill(field, value) {
         field.focus(); field.click();
@@ -1030,6 +1001,6 @@
     document.addEventListener('keydown', (e) => { if (e.ctrlKey && e.shiftKey && e.key === 'T') { e.preventDefault(); showPicker(); } });
 
     window.__orbitCombinedVersion = '4.5.0';
-    console.log('[Orbit Combined v4.5.0] Loaded — HE fill guard + Static Response N/A auto-trigger');
+    console.log('[Orbit Combined v4.5.0] Loaded — HE fill guard (v4.5.7: Static Response N/A auto-trigger removed)');
 
 })();
